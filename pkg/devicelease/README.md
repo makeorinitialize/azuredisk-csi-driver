@@ -1,7 +1,7 @@
 # Azure Disk origin boundary
 
-This package has a raw pre-attachment reservation adapter and a separate
-owner-admission boundary. It is not a DeviceProvider service. `azuredisk.DriverOptions.Origin` is
+This package has a pre-attachment reservation service and a separate
+owner-admission boundary. `azuredisk.DriverOptions.Origin` is
 nil by default. There is deliberately no command-line switch, listener,
 manifest change, or production `Authority`. Do not mix guarded and unguarded
 driver instances for a provider domain containing origins.
@@ -49,20 +49,55 @@ A GET/404, request tag, unused-looking disk, ConfigMap CAS or local mutex
 alone does not establish that authority. No implementation enabling it in a
 deployed driver is provided.
 
-**v1 mapping:** after authenticating the caller and validating the exact
-provider, a future endpoint can map `Capacity` to both capacity fields (one
-slot) and `Reserve`/`Lookup` to RESERVED snapshots of the binding, with the
-configured pool and actual byte count. These Go methods are not wire-compatible
-RPCs. They must not be used to serve lease snapshots once ownership is enabled:
-first unify the journal with active/held state and the provider-wide request
-ledger for *all* mutating methods.
+## DeviceProvider v1 reservation endpoint
+
+`NewReservationServer(reservations, serverKeyPair, clientRoots, grants)` returns
+a registered gRPC server, not a listener. A trusted host must supply the
+`Reservations` above **with a nonempty inventory GUID**, verified exclusive
+`ProvisioningScope`, dedicated listener and shutdown lifecycle before calling
+`Serve`. No CSI startup path calls it. There is no wire route to dynamic disk
+creation, even for an authenticated controller. If the provider operator
+cannot establish exclusivity, leave the listener off; do not substitute a
+local mutex or an always-successful scope.
+
+Use explicit client CA roots and TLS 1.3. Configure each `ReservationGrant`
+with SHA-256 of the client leaf certificate **DER**, `ReservationReader` or
+`ReservationController`, and the exact composite IDs it may access. Both
+roles may read pool capacity and their volumes' leases; only a controller
+may reserve. There is no wildcard, CN, header or cluster-wide default.
+Restart with new grants and certificates to rotate or revoke access.
+
+In the facade controller's `--controller-config`, set the `origin` field as
+below (replace these illustrative values; retain its other required fields):
+
+```json
+{"origin":{"id":"az-origin-A","address":"origin.provider.example:443",
+  "serverName":"origin.provider.example","ca":"/etc/origin/server-ca.pem",
+  "cert":"/etc/origin/controller.pem","key":"/etc/origin/controller.key"}}
+```
+
+`id` is **exactly** `RawPool.Provider`; the trusted inventory row's
+`originPool` must be **exactly** `RawPool.PoolID`, with the actual origin
+allocation unit (`RawPool.Bytes` for this fixed slot). Grant the composite
+IDs the facade actually sends. Use a server certificate for that `serverName`
+and the matching client certificate/key. Do not configure this as a cache route.
+
+The public bindings in `api/v1` use the canonical `dmstack.provider.v1`
+schema with only the Go package option changed (canonical LF SHA-256:
+`304365e871c08efe7aea330bca6a1c2c00c0757a1ad1434c7f2a52f1af4ca2f0`).
+Run `sh pkg/devicelease/api/v1/generate.sh` with its exact tool versions on
+PATH to reproduce them. Separate processes interoperate by wire name and
+field number; do not link two generated copies of the schema in one binary.
+The three implemented RPCs are `GetCapacity` (both limits describe one
+slot), `Reserve` and `GetLease` (RESERVED only). This is not a full CSI
+volume lifecycle: Acquire, Validate, Renew and Release return UNIMPLEMENTED.
 
 ## What is not integrated
 
-* **Secure endpoint and ownership lifecycle:** `pkg/azuredisk/azuredisk.go`
-  registers CSI services only. Before exposing any DeviceProvider endpoint,
-  integrate the canonical v1 bindings and authenticate and authorize every
-  operation, including retries. Acquisition, renewal, validated cleanup,
+* **Production host and ownership lifecycle:** `pkg/azuredisk/azuredisk.go`
+  registers CSI services only. Before enabling ownership, unify the reservation
+  journal with active/held state and the request ledger for every mutation.
+  Acquisition, renewal, validated cleanup,
   release, owner-clock/high-water persistence and cross-node physical fencing
   have no production implementation. `Admit` is not a wire-level Acquire handler.
 * **Provider exclusion and identity:** `Authority.Begin` must cover *all*

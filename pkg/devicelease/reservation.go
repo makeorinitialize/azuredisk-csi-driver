@@ -262,6 +262,10 @@ func (r *Reservations) Capacity(ctx context.Context, poolID string) (uint64, err
 }
 
 func (r *Reservations) Lookup(ctx context.Context, allocationID string) (Binding, error) {
+	return r.lookup(ctx, allocationID, nil)
+}
+
+func (r *Reservations) lookup(ctx context.Context, allocationID string, allowed func(string) bool) (Binding, error) {
 	if !validID(allocationID) {
 		return Binding{}, status.Error(codes.InvalidArgument, "missing allocation ID")
 	}
@@ -273,6 +277,11 @@ func (r *Reservations) Lookup(ctx context.Context, allocationID string) (Binding
 		}
 		if l.Phase == "free" || allocationID != r.allocationID() {
 			return status.Error(codes.NotFound, "no such allocation")
+		}
+		// The key contains no composite. Resolve scope from the same
+		// authoritative snapshot before inspecting ARM or returning state.
+		if allowed != nil && !allowed(l.Requests[l.First].Composite) {
+			return status.Error(codes.PermissionDenied, "composite outside client grant")
 		}
 		if l.Phase != "reserved" {
 			return status.Error(codes.Unavailable, "origin provisioning unresolved")
