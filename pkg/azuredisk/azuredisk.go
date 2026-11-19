@@ -106,7 +106,8 @@ type hostUtil interface {
 // Driver is the implementation of the Azure Disk CSI Driver.
 type Driver struct {
 	csicommon.CSIDriver
-	origin *devicelease.Origin
+	origin         *devicelease.Origin
+	publishedBlock *devicelease.BlockHold
 	// Embed UnimplementedXXXServer to ensure the driver returns Unimplemented for any
 	// new RPC methods that might be introduced in future versions of the spec.
 	csi.UnimplementedControllerServer
@@ -205,7 +206,7 @@ type Driver struct {
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
 func NewDriver(options *DriverOptions) *Driver {
-	driver := Driver{origin: options.Origin}
+	driver := Driver{origin: options.Origin, publishedBlock: options.PublishedBlock}
 	if options.FeatureGates == nil {
 		options.FeatureGates = NewDriverFeatureGate()
 	}
@@ -373,6 +374,9 @@ func NewDriver(options *DriverOptions) *Driver {
 		driver.diskController = NewManagedDiskController(driver.cloud)
 		driver.diskController.AttachDetachInitialDelayInMs = int(driver.attachDetachInitialDelayInMs)
 		driver.diskController.ForceDetachBackoff = driver.forceDetachBackoff
+		if driver.publishedBlock != nil {
+			driver.diskController.noForceDiskID = driver.publishedBlock.Selection().ResourceID
+		}
 		driver.diskController.WaitForDetach = driver.waitForDetach
 		driver.diskController.WaitForDetachDiskComplete = driver.waitForDetachDiskComplete
 		driver.diskController.CheckDiskCountForBatching = driver.checkDiskCountForBatching

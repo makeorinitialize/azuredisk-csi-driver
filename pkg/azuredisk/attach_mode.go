@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
@@ -30,6 +33,40 @@ import (
 // Ordinary CSI has no origin owner credentials. Hold its admission across the
 // entire call, including QAD and the controller's dangling-attach recovery.
 func (d *Driver) guardDisk(ctx context.Context, rpc proto.Message, diskURI string) (func(), error) {
+	if d.publishedBlock.Matches(diskURI) {
+		if d.origin != nil {
+			return nil, fmt.Errorf("cannot combine origin and published block modes")
+		}
+		switch q := rpc.(type) {
+		case *csi.ControllerUnpublishVolumeRequest:
+			if q.NodeId != d.publishedBlock.Selection().NodeID {
+				return nil, status.Error(codes.FailedPrecondition, "wrong node for selected disk teardown")
+			}
+		case *csi.NodeUnpublishVolumeRequest, *csi.NodeUnstageVolumeRequest:
+			if d.NodeID != d.publishedBlock.Selection().NodeID {
+				return nil, status.Error(codes.FailedPrecondition, "wrong node for selected disk teardown")
+			}
+		case *csi.DeleteVolumeRequest:
+		default:
+			return nil, status.Error(codes.FailedPrecondition, "operation not supported for selected block disk")
+		}
+		if err := d.publishedBlock.EnterTeardown(ctx); err != nil {
+			return nil, err
+		}
+		return func() {}, nil
+	}
+	if d.publishedBlock != nil {
+		switch rpc.(type) {
+		case *csi.ControllerPublishVolumeRequest, *csi.ControllerUnpublishVolumeRequest:
+			// These paths can enter VM helpers that also match by basename.
+			// Disk-RP operations use the full ARM ID and do not share this
+			// ambiguity across resource groups or subscriptions.
+			id := d.publishedBlock.Selection().ResourceID
+			if strings.EqualFold(diskURI[strings.LastIndexByte(diskURI, '/')+1:], id[strings.LastIndexByte(id, '/')+1:]) {
+				return nil, status.Error(codes.FailedPrecondition, "ambiguous selected disk basename")
+			}
+		}
+	}
 	if d.origin == nil {
 		return func() {}, nil
 	}

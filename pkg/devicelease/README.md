@@ -15,6 +15,95 @@ independently proven exclusive access, or rechecks the exact live incarnation.
 the operation. None of these methods releases, detaches, deletes, or takes over
 an origin.
 
+## Ordinary CSI-provisioned disposable Block PV (one use)
+
+This mode uses neither raw reservation nor the origin attach adapter. Provision
+the normal CSI volume first. Before its first publication, a trusted operator
+must preselect the bound RWO Block PV and PVC (both names and UIDs), disk ARM ID,
+Azure unique ID, capacity, VM ARM ID and incarnation, exact composite, node and
+owner epoch. Seed a new ConfigMap with `InitialBlockHold(selection)`, pin its
+server UID, and install the same `DriverOptions.PublishedBlock` on **all**
+controller/node instances. Never reset, replace or roll back the journal.
+Do not enroll over a running unguarded operation. Setup, release and rollback
+protection assume exclusive RBAC, trusted CSI clients/target paths and no
+out-of-band disk mutation. There is deliberately no deployment flag.
+
+The actual controller publish and ordinary node setup run inside durable
+setup markers. An ambiguous setup remains blocked, even across restart.
+`Driver.PublishedBlockServer` uses the existing mTLS `DeviceProvider` service:
+call `Acquire` with the exact enrolled Allocation, node, epoch and previous
+epoch zero; use `GetLease` for observation and `Release` with mode NODE and
+the authenticated cleanup receipt ID. `Acquire` only resolves an already
+published attachment. It does not attach, open a raw device, or return a
+device path. Both Azure RPs, exact disk GUID and explicit `maxShares=1` must
+agree; PV metadata alone does not grant use. `Validate` is read-only and
+requires independent node-side custody (below). `Renew` extends only the exact
+still-live enrolled owner after fresh PV/PVC and both Azure RP observations;
+it does not replace opened-device validation. No wire `Reserve` or ALLOCATION
+release is implemented in this mode.
+The one-minute liveness deadline is not a physical fence; expiration retains
+the hold and continues blocking teardown.
+
+Call `Renew` before the provider deadline with a fresh request ID (at most
+1024 UTF-8 bytes); retry uncertain outcomes with the **same** ID and input.
+Successful renewal input digests and deadlines commit together in the existing
+ConfigMap CAS as a pending candidate. A confirmation CAS is authorized only
+after observing that candidate while the **previous** deadline is still live.
+Pending candidates grant no acquired lease; their new deadline cannot revive
+an expired hold after a late/lost write response or restart. Retry a pending
+candidate with its original request ID before the previous deadline, or
+perform verified cleanup. Cleanup also accepts pending holds.
+Exact confirmed replays recheck attachment and return the current live
+owner snapshot without extending it, including after server restart. Reusing
+an Acquire/Release key or changing a committed renewal input is rejected.
+Expired holds cannot be renewed, and rejected claims do not consume history.
+The one-use journal retains at most 2048 successful renewal IDs, never evicts
+them, and returns RESOURCE_EXHAUSTED for new renewals when full; arrange
+verified cleanup before that limit, not journal reset or slot reuse.
+Legacy one-shot journals migrate on the first admitted renewal candidate without
+discarding any old fields; legacy and upgraded journals both support verified
+cleanup. Unsupported renewal history fails closed. Do not downgrade to an
+older binary that does not understand renewal history.
+
+Ordinary unpublish/unstage/delete admission and hold acquisition CAS the
+same object. If teardown wins, hold admission is permanently closed **before**
+the physical operation. If hold wins, teardown is denied until the exact
+owner releases with independently verified runtime cleanup. Only then may
+normal cleanup run (no force retry for the selection). Never reuse this slot.
+Mixed detach batches exclude the selection from force retries regardless of
+which disk's caller drains the batch. Controller publish/unpublish also reject
+ambiguous same-basename handles; unrelated Delete/Modify/Expand operations
+retain full ARM-ID targeting across resource groups.
+
+`BlockCleanup.VerifyCleanup` is the integration point for a trusted receipt
+resolver: verify completed hot-unplug and no further IO for the exact disk,
+VM, composite, node and epoch. No receipt issuer, real sandbox attestation,
+or Kata delivery mechanism ships here. IDs in the v1 allocation are opaque;
+do not lowercase ARM IDs or interpret them as Kata tokens. The host must
+independently bind its safe device token to the exact approved allocation.
+
+**Physical Validate prerequisite:** install the hold returned by
+`hold.WithOpenedAuthority(authority)` before constructing the published server.
+The node's verified mTLS leaf, node, VM incarnation, composite, disk GUID,
+allocation/generation and owner epoch must identify exactly one immutable
+exclusive-open registration. The trusted node custodian must retain a
+duplicate **at the original exclusive open**, independently obtain a
+duplicate of the authenticated facade's **current** FD, and serialize against
+its replacement, revocation and cleanup. The pins must stay valid through
+the evidence check. Never look up a caller-supplied path or trust an FD
+number, major:minor, receipt string or `ValidateRequest` as attestation.
+
+`LinuxBlockOpenAuthority` is a same-kernel adapter for such custody. It uses
+`F_DUPFD_QUERY` (unsupported kernels fail closed), verifies block mode and
+reads `st_rdev` via `fstat`. Its `IdentifyOpened` hook has the existing
+`Session.IdentifyOpened` contract: obtain the actual size from the handle
+(e.g. BLKGETSIZE64) and independently correlate its SCSI/NVMe disk identity
+with the enrolled Azure disk, generation and exclusive owner. Cross-node
+deployments need an authenticated, fresh proof from that node, not an FD
+number sent to a different kernel. No custody broker, device resolver or
+attestation transport is installed by this patch. Without it, `Validate`
+fails; successful validation is a snapshot, not permission for later IO.
+
 ## Raw reservations (one provider, one pool, one slot)
 
 Bootstrap **once**, offline: enroll a dedicated, never-attached slot; create
@@ -133,7 +222,9 @@ or successor is issued. `Validate`, `Renew` and `Release` remain UNIMPLEMENTED.
 
 * **Production host and ownership lifecycle:** `pkg/azuredisk/azuredisk.go`
   registers CSI services only. Production listener, grant provisioning,
-  renewal, validated cleanup, release and successor ownership remain pending.
+  automatic renewal scheduling, validated cleanup and successor ownership
+  remain pending. The published-block RPC implements renewal and receipt-gated
+  node release, but installs neither a renewal loop nor a receipt authority.
 * **Provider exclusion and identity:** `Authority.Begin` must cover *all*
   controllers, nodes and out-of-band actors. `Session.ProveOrdinary` must bind
   the actual effect targets, not just trust a CSI handle, mount path, LUN or PV.

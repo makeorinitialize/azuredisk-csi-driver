@@ -223,7 +223,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if diskParams.ResourceGroup == "" {
 		diskParams.ResourceGroup = d.cloud.ResourceGroup
 	}
-	if d.origin != nil {
+	if d.origin != nil || d.publishedBlock != nil {
 		sub := diskParams.SubscriptionID
 		if sub == "" {
 			sub = localCloud.SubscriptionID
@@ -232,11 +232,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if src := req.GetVolumeContentSource().GetVolume(); src != nil {
 			ids = append(ids, src.GetVolumeId())
 		}
-		end, err := d.origin.BeginCSI(ctx, req, ids...)
-		if err != nil {
-			return nil, err
+		for _, id := range ids {
+			if d.publishedBlock.Matches(id) {
+				return nil, status.Error(codes.FailedPrecondition, "block selection is for an already provisioned disk")
+			}
 		}
-		defer end()
+		if d.origin != nil {
+			end, err := d.origin.BeginCSI(ctx, req, ids...)
+			if err != nil {
+				return nil, err
+			}
+			defer end()
+		}
 	}
 
 	// normalize values
@@ -868,11 +875,10 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 // ControllerPublishVolume attach an azure disk to a required node
 func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runBlockSetup(ctx, d, req, req.GetNodeId(), true, d.controllerPublish)
+}
+
+func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -909,6 +915,19 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		}
 	}
 
+	if d.publishedBlock.Matches(diskURI) {
+		s := d.publishedBlock.Selection()
+		if req.Readonly || disk == nil || disk.ID == nil || !strings.EqualFold(*disk.ID, s.ResourceID) || disk.Properties == nil ||
+			ptr.Deref(disk.Properties.UniqueID, "") != s.DiskUniqueID || ptr.Deref(disk.Properties.DiskSizeBytes, 0) != s.CapacityBytes ||
+			ptr.Deref(disk.Properties.MaxShares, 0) != 1 || len(disk.Properties.ShareInfo) != 0 || len(disk.ManagedByExtended) != 0 ||
+			!strings.EqualFold(ptr.Deref(disk.Properties.ProvisioningState, ""), "Succeeded") || disk.Properties.PropertyUpdatesInProgress != nil {
+			return nil, status.Error(codes.FailedPrecondition, "ordinary publication of enrolled disk incarnation unconfirmed")
+		}
+		vm, vmErr := (originAttachment{d}).Observe(ctx, s.NodeID)
+		if vmErr != nil || !strings.EqualFold(vm.ID, s.VMID) || vm.InstanceGUID != s.VMGUID || !strings.EqualFold(vm.ProvisioningState, "Succeeded") {
+			return nil, status.Error(codes.Unavailable, "enrolled target VM unavailable")
+		}
+	}
 	nodeID := req.GetNodeId()
 	if len(nodeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
@@ -1034,6 +1053,9 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		lun, err = d.diskController.AttachDisk(ctx, diskName, diskURI, nodeName, cachingMode, disk, occupiedLuns)
 		if err != nil {
 			if derr, ok := err.(*volerr.DanglingAttachError); ok {
+				if d.publishedBlock.Matches(diskURI) {
+					return nil, status.Error(codes.FailedPrecondition, "selected block disk has a dangling attachment")
+				}
 				if strings.EqualFold(string(nodeName), string(derr.CurrentNode)) {
 					err := status.Errorf(codes.Internal, "volume %s is actually attached to current node %s, return error", diskURI, nodeName)
 					klog.Warningf("%v", err)

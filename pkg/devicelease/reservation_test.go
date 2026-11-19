@@ -48,6 +48,7 @@ type testDisks struct {
 	disk                 *armcompute.Disk
 	creates              int
 	getErr, putErr       error
+	beforeCreate         func()
 }
 
 func (c *testDisks) GetDiskClientForSub(sub string) (diskclient.Interface, error) {
@@ -71,6 +72,9 @@ func (c *testDisks) Get(_ context.Context, rg, name string) (*armcompute.Disk, e
 	return c.disk, nil
 }
 func (c *testDisks) CreateOrUpdate(_ context.Context, rg, name string, d armcompute.Disk) (*armcompute.Disk, error) {
+	if c.beforeCreate != nil {
+		c.beforeCreate()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.creates++
@@ -145,11 +149,13 @@ func fixture(t *testing.T, inventory string) *reservationFixture {
 		require.NoError(t, err)
 		next.ResourceVersion = strconv.Itoa(version + 1)
 		require.NoError(t, f.client.Tracker().Update(gvr, next, next.Namespace))
-		var l ledger
-		require.NoError(t, json.Unmarshal([]byte(next.Data[journalKey]), &l))
-		if f.losePhase != "" && l.Phase == f.losePhase {
-			f.losePhase = ""
-			return true, nil, errUncertain
+		if f.losePhase != "" {
+			var l ledger
+			require.NoError(t, json.Unmarshal([]byte(next.Data[journalKey]), &l))
+			if l.Phase == f.losePhase {
+				f.losePhase = ""
+				return true, nil, errUncertain
+			}
 		}
 		return true, next, nil
 	})
@@ -238,6 +244,8 @@ func TestRawReservationCAS(t *testing.T) {
 	first, second := f.adapter(t), f.adapter(t)
 	entered, release := make(chan struct{}, 2), make(chan struct{})
 	f.scope.beforeCapacity = func() { entered <- struct{}{}; <-release }
+	creating, allowCreate := make(chan struct{}), make(chan struct{})
+	f.disks.beforeCreate = func() { close(creating); <-allowCreate }
 	type result struct {
 		b   Binding
 		err error
@@ -250,12 +258,16 @@ func TestRawReservationCAS(t *testing.T) {
 	<-entered
 	<-entered
 	close(release)
-	for range 2 {
-		got := <-replies
-		if got.err != nil {
-			require.Equal(t, codes.Unavailable, status.Code(got.err))
-		}
-	}
+	// Keep the winner in submitted until the loser has finished. Otherwise a
+	// losing request can read a stale free journal, then observe the winner's
+	// newly created disk and correctly reject adoption with FailedPrecondition.
+	<-creating
+	loser := <-replies
+	close(allowCreate)
+	winner := <-replies
+	require.Equal(t, codes.Unavailable, status.Code(loser.err))
+	require.Zero(t, loser.b)
+	require.NoError(t, winner.err)
 	b, err := first.reserveTest(ctx, "0")
 	require.NoError(t, err)
 	other, err := second.reserveTest(ctx, "1")

@@ -50,15 +50,17 @@ type ReservationGrant struct {
 }
 
 type reservationGrant struct {
-	role    ReservationRole
-	volumes map[string]bool
-	node    string
+	role       ReservationRole
+	volumes    map[string]bool
+	node       string
+	peerDigest [sha256.Size]byte
 }
 type grantContextKey struct{}
 
 type reservationRPC struct {
 	pb.UnimplementedDeviceProviderServer
 	r      *Reservations
+	block  *publishedRPC
 	grants map[[sha256.Size]byte]reservationGrant
 }
 
@@ -69,16 +71,20 @@ func NewReservationServer(r *Reservations, cert tls.Certificate, clientCAs *x509
 	if r == nil || r.scope == nil || r.maps == nil || r.disks == nil || !r.pool.valid() || r.pool.InventoryGUID == "" {
 		return nil, status.Error(codes.FailedPrecondition, "pre-enrolled origin inventory and independent provisioning authority required")
 	}
+	return (&reservationRPC{r: r}).server(cert, clientCAs, grants)
+}
+
+func (s *reservationRPC) server(cert tls.Certificate, clientCAs *x509.CertPool, grants []ReservationGrant) (*grpc.Server, error) {
 	if len(cert.Certificate) == 0 || cert.PrivateKey == nil || clientCAs == nil || len(grants) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "server keypair, explicit client roots and client grants required")
 	}
-	s := &reservationRPC{r: r, grants: make(map[[sha256.Size]byte]reservationGrant, len(grants))}
+	s.grants = make(map[[sha256.Size]byte]reservationGrant, len(grants))
 	for _, g := range grants {
 		if _, duplicate := s.grants[g.ClientSHA256]; duplicate || g.ClientSHA256 == ([sha256.Size]byte{}) || (g.Role != ReservationReader && g.Role != ReservationController && g.Role != ReservationNode) || len(g.CompositeIDs) == 0 ||
 			(g.Role == ReservationNode && !validID(g.NodeID)) || (g.Role != ReservationNode && g.NodeID != "") {
 			return nil, status.Error(codes.InvalidArgument, "invalid or duplicate client grant")
 		}
-		entry := reservationGrant{g.Role, make(map[string]bool, len(g.CompositeIDs)), g.NodeID}
+		entry := reservationGrant{g.Role, make(map[string]bool, len(g.CompositeIDs)), g.NodeID, g.ClientSHA256}
 		for _, id := range g.CompositeIDs {
 			if !validID(id) {
 				return nil, status.Error(codes.InvalidArgument, "empty or malformed composite scope")
@@ -115,15 +121,29 @@ func (s *reservationRPC) authorize(ctx context.Context, req any, info *grpc.Unar
 		return nil, status.Error(codes.PermissionDenied, "no origin client grant")
 	}
 	switch info.FullMethod {
-	case pb.DeviceProvider_GetCapacity_FullMethodName, pb.DeviceProvider_GetLease_FullMethodName:
+	case pb.DeviceProvider_GetLease_FullMethodName:
+	case pb.DeviceProvider_GetCapacity_FullMethodName:
+		if s.block != nil {
+			return nil, status.Error(codes.Unimplemented, "selected block PV is already provisioned")
+		}
+	case pb.DeviceProvider_Release_FullMethodName, pb.DeviceProvider_Validate_FullMethodName, pb.DeviceProvider_Renew_FullMethodName:
+		if s.block == nil {
+			return nil, status.Error(codes.Unimplemented, "published block operation unavailable")
+		}
+		if g.role != ReservationNode {
+			return nil, status.Error(codes.PermissionDenied, "node-specific grant required")
+		}
 	case pb.DeviceProvider_Acquire_FullMethodName:
-		if s.r.attach == nil {
+		if s.block == nil && s.r.attach == nil {
 			return nil, status.Error(codes.Unimplemented, "controller acquisition disabled")
 		}
 		if g.role != ReservationNode {
 			return nil, status.Error(codes.PermissionDenied, "node-specific grant required")
 		}
 	case pb.DeviceProvider_Reserve_FullMethodName:
+		if s.block != nil {
+			return nil, status.Error(codes.Unimplemented, "selected block PV is already provisioned")
+		}
 		if g.role != ReservationController {
 			return nil, status.Error(codes.PermissionDenied, "controller grant required")
 		}
@@ -174,6 +194,9 @@ func (s *reservationRPC) Reserve(ctx context.Context, in *pb.ReserveRequest) (*p
 }
 
 func (s *reservationRPC) Acquire(ctx context.Context, in *pb.AcquireRequest) (*pb.Lease, error) {
+	if s.block != nil {
+		return s.block.acquire(ctx, in)
+	}
 	o := in.GetOwner()
 	a := o.GetAllocation()
 	k := a.GetKey()
@@ -196,6 +219,9 @@ func (s *reservationRPC) Acquire(ctx context.Context, in *pb.AcquireRequest) (*p
 }
 
 func (s *reservationRPC) GetLease(ctx context.Context, k *pb.LeaseKey) (*pb.Lease, error) {
+	if s.block != nil {
+		return s.block.lookup(ctx, k)
+	}
 	if k == nil || !validID(k.Provider) || !validID(k.LeaseId) || len(k.ProtoReflect().GetUnknown()) != 0 {
 		return nil, status.Error(codes.InvalidArgument, "invalid lease key")
 	}

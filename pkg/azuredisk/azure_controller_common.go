@@ -109,6 +109,7 @@ type controllerCommon struct {
 	// This timeout should be lower than DetachOperationMinTimeoutInSeconds and cover most detach operations
 	VMSSDetachTimeoutInSeconds int
 	ForceDetachBackoff         bool
+	noForceDiskID              string
 	WaitForDetach              bool
 	CheckDiskCountForBatching  bool
 	// WaitForDetachDiskComplete controls whether detach waits until the disk is no longer managed by the detach target node:
@@ -515,8 +516,23 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
 		}
 
 		if err != nil && c.ForceDetachBackoff {
-			klog.Errorf("azureDisk - DetachDisk(%s) from node %s failed with error: %v, retry with force detach", diskName, nodeName, err)
-			err = vmset.DetachDisk(ctx, nodeName, diskMap, true)
+			// Batches can be drained by a different caller. Never include a
+			// selected block PV in a force retry, regardless of who drains it.
+			if _, has := diskMap[strings.ToLower(c.noForceDiskID)]; has {
+				delete(diskMap, strings.ToLower(c.noForceDiskID))
+				if len(diskMap) > 0 {
+					if otherErr := vmset.DetachDisk(ctx, nodeName, diskMap, true); otherErr != nil {
+						return otherErr
+					}
+				}
+				if formattedDiskURI == strings.ToLower(c.noForceDiskID) {
+					return err
+				}
+				err = nil
+			} else {
+				klog.Errorf("azureDisk - DetachDisk(%s) from node %s failed with error: %v, retry with force detach", diskName, nodeName, err)
+				err = vmset.DetachDisk(ctx, nodeName, diskMap, true)
+			}
 		}
 	}
 

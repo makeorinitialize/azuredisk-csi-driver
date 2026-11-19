@@ -188,11 +188,9 @@ func postAttachErrorCode(qadAttached bool) codes.Code {
 
 // NodeStageVolume mount disk device to a staging path
 func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runBlockSetup(ctx, d, req, d.NodeID, false, d.nodeStage)
+}
+func (d *Driver) nodeStage(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -581,11 +579,9 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 
 // NodePublishVolume mount the volume from staging to target path
 func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runBlockSetup(ctx, d, req, d.NodeID, false, d.nodePublish)
+}
+func (d *Driver) nodePublish(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	mc := csiMetrics.NewCSIMetricContext("node_publish_volume")
 	isOperationSucceeded := false
 	defer func() {

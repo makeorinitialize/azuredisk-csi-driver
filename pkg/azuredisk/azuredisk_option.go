@@ -31,6 +31,8 @@ import (
 type DriverOptions struct {
 	// Origin is a programmatic opt-in only. No listener or production authority is installed.
 	Origin *devicelease.Origin
+	// PublishedBlock is a separate, one-use guard for an ordinary CSI block PV.
+	PublishedBlock *devicelease.BlockHold
 	// Common options
 	NodeID                     string
 	DriverName                 string
