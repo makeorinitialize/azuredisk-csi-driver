@@ -104,7 +104,14 @@ Admission binds the first valid request, owner epoch, ARM VM ID and VM
 incarnation in one CAS (`attachPrepared`). Rejected new claims do not consume
 journal space; already-bound keys still require an exact replay. Prepared
 means **not dispatched**: only the same claim may retry its disk and VM
-preflight, and it cannot repin the VM. Only a confirmed `attachPrepared` →
+preflight, and it cannot repin the VM. If Azure positively identifies a
+healthy replacement with a different VM GUID while both views show no disk
+attachment, a CAS on that exact prepared record retires the old key and
+returns the slot to `reserved`. The key stays bound: exact retries are
+ABORTED, changed inputs are ALREADY_EXISTS. A fresh authorized request must
+pass normal preflight. An incomplete read or CAS conflict cannot clear the
+intent, and retirement never applies after dispatch became possible.
+Only a confirmed `attachPrepared` →
 `attaching` CAS winner may call the existing normal `AttachDisk` implementation.
 Azure's non-shared disk semantics exclude other VMs; there is no second
 distributed fencer. The adapter does not enter the dangling-disk detach

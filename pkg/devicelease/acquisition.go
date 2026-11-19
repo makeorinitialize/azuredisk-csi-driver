@@ -201,8 +201,13 @@ func (r *Reservations) acquire(ctx context.Context, key string, c attachInput) (
 			if _, used := l.Requests[key]; used {
 				return status.Error(codes.AlreadyExists, "request ID belongs to Reserve")
 			}
-			if old, ok := l.Claims[key]; ok && old != c {
-				return status.Error(codes.AlreadyExists, "request ID bound to another acquire intent")
+			if old, ok := l.Claims[key]; ok {
+				if old.attachInput != c {
+					return status.Error(codes.AlreadyExists, "request ID bound to another acquire intent")
+				}
+				if old.Retired {
+					return status.Error(codes.Aborted, "prepared request retired after target VM replacement")
+				}
 			}
 			if l.Phase == "submitted" {
 				return status.Error(codes.Unavailable, "reservation incomplete")
@@ -226,9 +231,6 @@ func (r *Reservations) acquire(ctx context.Context, key string, c attachInput) (
 				if err != nil {
 					return unavailable(err)
 				}
-				if l.Phase == "attachPrepared" && (!strings.EqualFold(vm.ID, l.TargetVM) || vm.InstanceGUID != l.TargetGUID) {
-					return status.Error(codes.Aborted, "target VM incarnation changed before dispatch")
-				}
 				present, err := vm.hasDisk(c.Binding.ResourceID)
 				if err != nil {
 					return err
@@ -236,13 +238,30 @@ func (r *Reservations) acquire(ctx context.Context, key string, c attachInput) (
 				if present {
 					return status.Error(codes.FailedPrecondition, "pre-existing VM attachment")
 				}
+				if l.Phase == "attachPrepared" && (!strings.EqualFold(vm.ID, l.TargetVM) || vm.InstanceGUID != l.TargetGUID) {
+					if strings.EqualFold(vm.InstanceGUID, l.TargetGUID) {
+						return status.Error(codes.Aborted, "target identity changed without proof of a replacement VM")
+					}
+					// Only this resourceVersion proves the exact intent is still
+					// unsent. Never retry this reset against a newer snapshot.
+					l.Claims[key] = attachClaim{attachInput: c, Retired: true}
+					l.Phase, l.AttachKey, l.TargetVM, l.TargetGUID = "reserved", "", "", ""
+					ok, err := r.save(ctx, cm, l)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return status.Error(codes.Aborted, "prepared intent changed before retirement")
+					}
+					return status.Error(codes.Aborted, "prepared request retired after target VM replacement")
+				}
 				if l.Phase == "reserved" {
 					// Bind the admitted key and both target identities atomically.
 					// No dispatch is possible while the journal is in this phase.
 					if l.Claims == nil {
-						l.Claims = map[string]attachInput{}
+						l.Claims = map[string]attachClaim{}
 					}
-					l.Claims[key] = c
+					l.Claims[key] = attachClaim{attachInput: c}
 					l.Phase, l.AttachKey, l.TargetVM, l.TargetGUID = "attachPrepared", key, vm.ID, vm.InstanceGUID
 					if _, err = r.save(ctx, cm, l); err != nil {
 						return err

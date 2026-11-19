@@ -101,11 +101,6 @@ func TestControllerOriginPreparedRetry(t *testing.T) {
 			require.Equal(t, codes.AlreadyExists, status.Code(err))
 			_, err = r.acquire(ctx, "successor", newer)
 			require.Equal(t, codes.FailedPrecondition, status.Code(err))
-			pinned := m.vm
-			m.vm.InstanceGUID = "replacement"
-			_, err = r.acquire(ctx, "key", c)
-			require.Equal(t, codes.Aborted, status.Code(err))
-			m.vm = pinned
 			require.Zero(t, m.dispatch)
 
 			// The first real dispatch loses its reply. Subsequent retries may
@@ -119,6 +114,89 @@ func TestControllerOriginPreparedRetry(t *testing.T) {
 			v, err := r.acquire(ctx, "key", c)
 			require.NoError(t, err)
 			require.Equal(t, c.Owner, v.Owner)
+			require.Equal(t, 1, m.dispatch)
+		})
+	}
+}
+
+func TestControllerOriginPreparedReplacement(t *testing.T) {
+	ctx := t.Context()
+	f, r, m, c := acquisitionFixture(t)
+	r.attach = &failSecondObservation{modelAttach: m, fail: func(vm TargetVM) (TargetVM, error) {
+		vm.InstanceGUID = "replacement"
+		vm.ProvisioningState = "Updating"
+		return vm, nil
+	}}
+	_, err := r.acquire(ctx, "old", c)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = r.acquire(ctx, "fresh", c)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	r, err = f.adapter(t).WithControllerAttachment(m)
+	require.NoError(t, err)
+	m.vm.InstanceGUID = "replacement"
+	f.losePhase = "reserved" // retirement commits, but the reply is lost
+	_, err = r.acquire(ctx, "old", c)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	r, err = f.adapter(t).WithControllerAttachment(m)
+	require.NoError(t, err)
+	_, err = r.acquire(ctx, "old", c)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	next := c
+	next.Owner.Epoch++
+	_, err = r.acquire(ctx, "old", next)
+	require.Equal(t, codes.AlreadyExists, status.Code(err))
+	_, err = r.reserveTest(ctx, "old")
+	require.Equal(t, codes.AlreadyExists, status.Code(err))
+	require.Zero(t, m.dispatch)
+	_, err = r.acquire(ctx, "fresh", next)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	m.complete(f.disks.disk)
+	got, err := r.acquire(ctx, "fresh", next)
+	require.NoError(t, err)
+	require.Equal(t, next.Owner, got.Owner)
+	require.Equal(t, c.Binding, got.Binding)
+	_, err = r.acquire(ctx, "old", c)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	require.Equal(t, 1, m.dispatch)
+}
+
+func TestControllerOriginStaleRetirementCAS(t *testing.T) {
+	for _, winner := range []string{"in-flight", "successor"} {
+		t.Run(winner, func(t *testing.T) {
+			ctx := t.Context()
+			f, stale, m, c := acquisitionFixture(t)
+			peer, err := f.adapter(t).WithControllerAttachment(m)
+			require.NoError(t, err)
+			key, claim := "old", c
+			stale.attach = &failSecondObservation{modelAttach: m, fail: func(vm TargetVM) (TargetVM, error) {
+				// Interleave a second replica between the stale reader's
+				// prepared GET and its retirement CAS.
+				vm.InstanceGUID = "replacement"
+				if winner == "successor" {
+					m.vm = vm
+					_, err := peer.acquire(ctx, "old", c)
+					require.Equal(t, codes.Aborted, status.Code(err))
+					key = "fresh"
+					claim.Owner.Epoch++
+				}
+				_, err := peer.acquire(ctx, key, claim)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				if winner == "successor" {
+					m.complete(f.disks.disk)
+					_, err = peer.acquire(ctx, key, claim)
+					require.NoError(t, err)
+				}
+				return vm, nil
+			}}
+			_, err = stale.acquire(ctx, "old", c)
+			require.Equal(t, codes.Aborted, status.Code(err))
+			require.Equal(t, 1, f.conflicts)
+			if winner == "in-flight" {
+				m.complete(f.disks.disk)
+			}
+			got, err := peer.acquire(ctx, key, claim)
+			require.NoError(t, err)
+			require.Equal(t, claim.Owner, got.Owner)
 			require.Equal(t, 1, m.dispatch)
 		})
 	}

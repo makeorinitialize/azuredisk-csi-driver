@@ -61,6 +61,11 @@ type reserveIntent struct {
 	Bytes                   uint64
 }
 
+type attachClaim struct {
+	attachInput
+	Retired bool `json:",omitempty"` // Never dispatched; the request ID remains consumed.
+}
+
 type ledger struct {
 	Version    int
 	Pool       RawPool
@@ -68,7 +73,7 @@ type ledger struct {
 	First      string // original request key; the allocation remains charged
 	Phase      string // free, submitted, reserved; missing is never free
 	GUID       string
-	Claims     map[string]attachInput `json:",omitempty"`
+	Claims     map[string]attachClaim `json:",omitempty"`
 	AttachKey  string                 `json:",omitempty"`
 	TargetVM   string                 `json:",omitempty"`
 	TargetGUID string                 `json:",omitempty"`
@@ -136,7 +141,7 @@ func (l *ledger) valid(pool RawPool) bool {
 	switch l.Phase {
 	case "attachPrepared", "attaching", "active", "held":
 		c, ok := l.Claims[l.AttachKey]
-		if !ok || !validVMID(l.TargetVM) || !validID(l.TargetGUID) || c.Previous != 0 {
+		if !ok || c.Retired || !validVMID(l.TargetVM) || !validID(l.TargetGUID) || c.Previous != 0 {
 			return false
 		}
 		pending := l.Phase == "attachPrepared" || l.Phase == "attaching"
