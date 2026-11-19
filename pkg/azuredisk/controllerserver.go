@@ -223,6 +223,21 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if diskParams.ResourceGroup == "" {
 		diskParams.ResourceGroup = d.cloud.ResourceGroup
 	}
+	if d.origin != nil {
+		sub := diskParams.SubscriptionID
+		if sub == "" {
+			sub = localCloud.SubscriptionID
+		}
+		ids := []string{fmt.Sprintf(consts.ManagedDiskPath, sub, diskParams.ResourceGroup, diskParams.DiskName)}
+		if src := req.GetVolumeContentSource().GetVolume(); src != nil {
+			ids = append(ids, src.GetVolumeId())
+		}
+		end, err := d.origin.BeginCSI(ctx, req, ids...)
+		if err != nil {
+			return nil, err
+		}
+		defer end()
+	}
 
 	// normalize values
 	skuName, err := azureutils.NormalizeStorageAccountType(diskParams.AccountType, localCloud.Config.Cloud, localCloud.Config.DisableAzureStackCloud)
@@ -662,6 +677,11 @@ func (d *Driver) unclaimDiskResource(ctx context.Context, diskURI, ownerResource
 
 // DeleteVolume delete an azure disk
 func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
@@ -740,6 +760,11 @@ func (d *Driver) ControllerGetVolume(context.Context, *csi.ControllerGetVolumeRe
 
 // ControllerModifyVolume modify volume
 func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
@@ -843,6 +868,11 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 // ControllerPublishVolume attach an azure disk to a required node
 func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -1101,6 +1131,11 @@ func ensureQADPVAnnotations(ctx context.Context, kubeClient clientset.Interface,
 
 // ControllerUnpublishVolume detach an azure disk from a required node
 func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -1474,6 +1509,11 @@ func (d *Driver) listVolumesByResourceGroup(ctx context.Context, resourceGroup s
 
 // ControllerExpandVolume controller expand volume
 func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
@@ -1558,6 +1598,11 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 
 // CreateSnapshot create a snapshot
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	end, guardErr := d.guardDisk(ctx, req, req.GetSourceVolumeId())
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	defer end()
 	sourceVolumeID := req.GetSourceVolumeId()
 	if len(sourceVolumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")

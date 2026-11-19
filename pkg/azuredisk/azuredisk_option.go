@@ -24,10 +24,13 @@ import (
 	"k8s.io/component-base/featuregate"
 
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 )
 
 // DriverOptions defines driver parameters specified in driver deployment
 type DriverOptions struct {
+	// Origin is a programmatic opt-in only. No listener or production authority is installed.
+	Origin *devicelease.Origin
 	// Common options
 	NodeID                     string
 	DriverName                 string

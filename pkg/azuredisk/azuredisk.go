@@ -63,6 +63,7 @@ import (
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
@@ -105,6 +106,7 @@ type hostUtil interface {
 // Driver is the implementation of the Azure Disk CSI Driver.
 type Driver struct {
 	csicommon.CSIDriver
+	origin *devicelease.Origin
 	// Embed UnimplementedXXXServer to ensure the driver returns Unimplemented for any
 	// new RPC methods that might be introduced in future versions of the spec.
 	csi.UnimplementedControllerServer
@@ -203,7 +205,7 @@ type Driver struct {
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
 func NewDriver(options *DriverOptions) *Driver {
-	driver := Driver{}
+	driver := Driver{origin: options.Origin}
 	if options.FeatureGates == nil {
 		options.FeatureGates = NewDriverFeatureGate()
 	}

@@ -17,12 +17,24 @@ limitations under the License.
 package azuredisk
 
 import (
+	"context"
 	"fmt"
 	"strings"
+
+	"google.golang.org/protobuf/proto"
 
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 )
+
+// Ordinary CSI has no origin owner credentials. Hold its admission across the
+// entire call, including QAD and the controller's dangling-attach recovery.
+func (d *Driver) guardDisk(ctx context.Context, rpc proto.Message, diskURI string) (func(), error) {
+	if d.origin == nil {
+		return func() {}, nil
+	}
+	return d.origin.BeginCSI(ctx, rpc, diskURI)
+}
 
 // getAttachMode returns the requested attachment architecture.
 func getAttachMode(parameters map[string]string) (string, error) {
