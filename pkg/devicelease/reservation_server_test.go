@@ -93,9 +93,9 @@ func TestReservationWire(t *testing.T) {
 	serverCert := testCert(t, 2, &ca, true)
 	controller, reader, other, unmapped := testCert(t, 3, &ca, false), testCert(t, 4, &ca, false), testCert(t, 5, &ca, false), testCert(t, 6, &ca, false)
 	grants := []ReservationGrant{
-		{sha256.Sum256(controller.Certificate[0]), ReservationController, []string{"Composite-A"}},
-		{sha256.Sum256(reader.Certificate[0]), ReservationReader, []string{"Composite-A"}},
-		{sha256.Sum256(other.Certificate[0]), ReservationController, []string{"composite-a"}},
+		{sha256.Sum256(controller.Certificate[0]), ReservationController, []string{"Composite-A"}, ""},
+		{sha256.Sum256(reader.Certificate[0]), ReservationReader, []string{"Composite-A"}, ""},
+		{sha256.Sum256(other.Certificate[0]), ReservationController, []string{"composite-a"}, ""},
 	}
 	f := fixture(t, "inventory-guid")
 	f.disks.disk = &armcompute.Disk{ID: ptr.To(resourceID), Location: ptr.To(f.pool.Location), Properties: &armcompute.DiskProperties{
@@ -186,6 +186,31 @@ func TestReservationWire(t *testing.T) {
 	_, err = client.Release(ctx, &pb.ReleaseRequest{})
 	require.Equal(t, codes.Unimplemented, status.Code(err))
 	require.Zero(t, f.disks.creates)
+
+	nodeCert := testCert(t, 7, &ca, false)
+	grants = append(grants, ReservationGrant{sha256.Sum256(nodeCert.Certificate[0]), ReservationNode, []string{"Composite-A"}, "node"})
+	m := newModelAttach()
+	ar, err := f.adapter(t).WithControllerAttachment(m)
+	require.NoError(t, err)
+	addr, _ = start(ar)
+	nodeClient, _ := dial(addr, nodeCert)
+	acq := &pb.AcquireRequest{RequestId: "attach", Owner: &pb.Owner{Allocation: b.Allocation, NodeId: "other", OwnerEpoch: 5}}
+	_, err = nodeClient.Acquire(ctx, acq)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	acq.Owner.NodeId = "node"
+	_, err = nodeClient.Acquire(ctx, acq)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	m.complete(f.disks.disk)
+	active, err := nodeClient.Acquire(ctx, acq)
+	require.NoError(t, err)
+	require.Equal(t, pb.LeaseState_LEASE_STATE_ACQUIRED, active.State)
+	require.Empty(t, active.ObservedDevicePath)
+	_, err = nodeClient.Validate(ctx, &pb.ValidateRequest{})
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	seen, err = nodeClient.GetLease(ctx, b.Allocation.Key)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(active, seen))
+	require.Equal(t, 1, m.dispatch)
 }
 
 func TestReservationWireRejectsDynamicSlot(t *testing.T) {

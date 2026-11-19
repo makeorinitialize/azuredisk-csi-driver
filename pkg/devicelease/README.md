@@ -88,27 +88,52 @@ schema with only the Go package option changed (canonical LF SHA-256:
 Run `sh pkg/devicelease/api/v1/generate.sh` with its exact tool versions on
 PATH to reproduce them. Separate processes interoperate by wire name and
 field number; do not link two generated copies of the schema in one binary.
-The three implemented RPCs are `GetCapacity` (both limits describe one
-slot), `Reserve` and `GetLease` (RESERVED only). This is not a full CSI
-volume lifecycle: Acquire, Validate, Renew and Release return UNIMPLEMENTED.
+By default the RPCs are `GetCapacity`, `Reserve` and `GetLease`.
+
+### Optional controller attachment
+
+Pass the adapter returned by `Driver.WithOriginController(reservations)` to
+`NewReservationServer` on a guarded controller, and install a `ReservationNode`
+certificate grant with exact `NodeID` and composite IDs. Only this role can
+call `Acquire`. All ordinary CSI instances and external principals must still
+respect enrollment. Do not mix the independent `Origin.Admit` test boundary
+with this journal as a second ownership authority. Older binaries reject
+journals with acquisition fields; do not reset the journal on downgrade.
+
+Admission binds the first valid request, owner epoch, ARM VM ID and VM
+incarnation in one CAS (`attachPrepared`). Rejected new claims do not consume
+journal space; already-bound keys still require an exact replay. Prepared
+means **not dispatched**: only the same claim may retry its disk and VM
+preflight, and it cannot repin the VM. Only a confirmed `attachPrepared` →
+`attaching` CAS winner may call the existing normal `AttachDisk` implementation.
+Azure's non-shared disk semantics exclude other VMs; there is no second
+distributed fencer. The adapter does not enter the dangling-disk detach
+branch. It verifies the current GUID, size, sharing configuration, disk
+`Attached` state and `ManagedBy`, plus the exact managed-disk entry on a
+freshly read, successfully provisioned VM/VMSS instance. A LUN alone, an
+accepted operation or a Kubernetes attachment object cannot confirm access.
+Once `attaching` is durable, even loss of that CAS reply or a crash before
+the call leaves dispatch ambiguous. Only read-only reconciliation is allowed;
+an unattached observation does not permit redispatch or takeover.
+
+`Acquire`, `GetLease` and compatible `Reserve` replays return the current
+owner snapshot. A one-minute deadline uses provider time (hosts need reliable
+clocks); expiry latches HELD and never grants another epoch. **No raw device
+is handed off.** No node path, major/minor, cleanup proof, release, renewal
+or successor is issued. `Validate`, `Renew` and `Release` remain UNIMPLEMENTED.
 
 ## What is not integrated
 
 * **Production host and ownership lifecycle:** `pkg/azuredisk/azuredisk.go`
-  registers CSI services only. Before enabling ownership, unify the reservation
-  journal with active/held state and the request ledger for every mutation.
-  Acquisition, renewal, validated cleanup,
-  release, owner-clock/high-water persistence and cross-node physical fencing
-  have no production implementation. `Admit` is not a wire-level Acquire handler.
+  registers CSI services only. Production listener, grant provisioning,
+  renewal, validated cleanup, release and successor ownership remain pending.
 * **Provider exclusion and identity:** `Authority.Begin` must cover *all*
   controllers, nodes and out-of-band actors. `Session.ProveOrdinary` must bind
   the actual effect targets, not just trust a CSI handle, mount path, LUN or PV.
   Async ARM/QAD work and uncertain completion need durable in-flight tracking
   before submission and reconciliation before enrollment/reuse, even when an
   RPC returns success. `End` releases admission; it does not mark a disk safe.
-* **Physical proof:** `Session.ProveExclusive` needs an independent fence
-  against other writers; an ARM GET is corroboration, not that fence.
-  `Session.IdentifyOpened` needs a trusted, platform-specific exclusive-open
+* **Local custody:** `Session.IdentifyOpened` needs a trusted, platform-specific exclusive-open
   and attestation path binding the device to this allocation, node and epoch.
   No such resolver ships here. There is no cleanup-receipt issuer, previous
   writer IO revocation, release or successor path. Retain ownership until

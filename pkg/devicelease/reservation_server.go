@@ -37,6 +37,7 @@ type ReservationRole string
 const (
 	ReservationReader     ReservationRole = "reader"
 	ReservationController ReservationRole = "controller"
+	ReservationNode       ReservationRole = "node"
 )
 
 // ReservationGrant identifies one verified leaf certificate by its DER
@@ -45,11 +46,13 @@ type ReservationGrant struct {
 	ClientSHA256 [sha256.Size]byte
 	Role         ReservationRole
 	CompositeIDs []string
+	NodeID       string // Required only for an acquiring node's certificate.
 }
 
 type reservationGrant struct {
 	role    ReservationRole
 	volumes map[string]bool
+	node    string
 }
 type grantContextKey struct{}
 
@@ -71,10 +74,11 @@ func NewReservationServer(r *Reservations, cert tls.Certificate, clientCAs *x509
 	}
 	s := &reservationRPC{r: r, grants: make(map[[sha256.Size]byte]reservationGrant, len(grants))}
 	for _, g := range grants {
-		if _, duplicate := s.grants[g.ClientSHA256]; duplicate || g.ClientSHA256 == ([sha256.Size]byte{}) || (g.Role != ReservationReader && g.Role != ReservationController) || len(g.CompositeIDs) == 0 {
+		if _, duplicate := s.grants[g.ClientSHA256]; duplicate || g.ClientSHA256 == ([sha256.Size]byte{}) || (g.Role != ReservationReader && g.Role != ReservationController && g.Role != ReservationNode) || len(g.CompositeIDs) == 0 ||
+			(g.Role == ReservationNode && !validID(g.NodeID)) || (g.Role != ReservationNode && g.NodeID != "") {
 			return nil, status.Error(codes.InvalidArgument, "invalid or duplicate client grant")
 		}
-		entry := reservationGrant{g.Role, make(map[string]bool, len(g.CompositeIDs))}
+		entry := reservationGrant{g.Role, make(map[string]bool, len(g.CompositeIDs)), g.NodeID}
 		for _, id := range g.CompositeIDs {
 			if !validID(id) {
 				return nil, status.Error(codes.InvalidArgument, "empty or malformed composite scope")
@@ -112,12 +116,19 @@ func (s *reservationRPC) authorize(ctx context.Context, req any, info *grpc.Unar
 	}
 	switch info.FullMethod {
 	case pb.DeviceProvider_GetCapacity_FullMethodName, pb.DeviceProvider_GetLease_FullMethodName:
+	case pb.DeviceProvider_Acquire_FullMethodName:
+		if s.r.attach == nil {
+			return nil, status.Error(codes.Unimplemented, "controller acquisition disabled")
+		}
+		if g.role != ReservationNode {
+			return nil, status.Error(codes.PermissionDenied, "node-specific grant required")
+		}
 	case pb.DeviceProvider_Reserve_FullMethodName:
 		if g.role != ReservationController {
 			return nil, status.Error(codes.PermissionDenied, "controller grant required")
 		}
 	default:
-		return nil, status.Error(codes.Unimplemented, "only pre-attachment reservations are supported")
+		return nil, status.Error(codes.Unimplemented, "unsupported origin operation")
 	}
 	return next(context.WithValue(ctx, grantContextKey{}, g), req)
 }
@@ -155,11 +166,33 @@ func (s *reservationRPC) Reserve(ctx context.Context, in *pb.ReserveRequest) (*p
 	if !ctx.Value(grantContextKey{}).(reservationGrant).volumes[in.CompositeVolumeId] {
 		return nil, status.Error(codes.PermissionDenied, "composite outside client grant")
 	}
-	b, err := s.r.Reserve(ctx, in.RequestId, in.Pool.PoolId, in.CompositeVolumeId, in.CapacityBytes)
+	b, err := s.r.reserve(ctx, in.RequestId, in.Pool.PoolId, in.CompositeVolumeId, in.CapacityBytes)
 	if err != nil {
 		return nil, err
 	}
 	return s.snapshot(b), nil
+}
+
+func (s *reservationRPC) Acquire(ctx context.Context, in *pb.AcquireRequest) (*pb.Lease, error) {
+	o := in.GetOwner()
+	a := o.GetAllocation()
+	k := a.GetKey()
+	if k == nil || !validID(k.Provider) || len(in.ProtoReflect().GetUnknown()) != 0 || len(o.ProtoReflect().GetUnknown()) != 0 || len(a.ProtoReflect().GetUnknown()) != 0 || len(k.ProtoReflect().GetUnknown()) != 0 {
+		return nil, status.Error(codes.InvalidArgument, "invalid acquire owner")
+	}
+	g := ctx.Value(grantContextKey{}).(reservationGrant)
+	if !g.volumes[a.CompositeVolumeId] || g.node != o.NodeId {
+		return nil, status.Error(codes.PermissionDenied, "node or composite outside client grant")
+	}
+	if k.Provider != s.r.pool.Provider {
+		return nil, status.Error(codes.NotFound, "unknown origin provider")
+	}
+	v, err := s.r.acquire(ctx, in.RequestId, attachInput{Binding: Binding{AllocationID: k.LeaseId, CompositeID: a.CompositeVolumeId, ResourceID: a.ResourceId,
+		DiskUniqueID: a.StableDeviceId, DeviceGeneration: a.DeviceGeneration, CapacityBytes: s.r.pool.Bytes}, Owner: Owner{NodeID: o.NodeId, Epoch: o.OwnerEpoch}, Previous: in.PreviousOwnerEpoch})
+	if err != nil {
+		return nil, err
+	}
+	return s.snapshot(v), nil
 }
 
 func (s *reservationRPC) GetLease(ctx context.Context, k *pb.LeaseKey) (*pb.Lease, error) {
@@ -177,8 +210,15 @@ func (s *reservationRPC) GetLease(ctx context.Context, k *pb.LeaseKey) (*pb.Leas
 	return s.snapshot(b), nil
 }
 
-func (s *reservationRPC) snapshot(b Binding) *pb.Lease {
+func (s *reservationRPC) snapshot(b ownerView) *pb.Lease {
+	state := pb.LeaseState_LEASE_STATE_RESERVED
+	if b.Epoch != 0 {
+		state = pb.LeaseState_LEASE_STATE_ACQUIRED
+	}
+	if b.Held {
+		state = pb.LeaseState_LEASE_STATE_HELD
+	}
 	return &pb.Lease{Allocation: &pb.Allocation{Key: &pb.LeaseKey{Provider: s.r.pool.Provider, LeaseId: b.AllocationID}, CompositeVolumeId: b.CompositeID,
 		ResourceId: b.ResourceID, StableDeviceId: b.DiskUniqueID, DeviceGeneration: b.DeviceGeneration}, PoolId: s.r.pool.PoolID,
-		CapacityBytes: uint64(b.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED}
+		CapacityBytes: uint64(b.CapacityBytes), State: state, NodeId: b.NodeID, OwnerEpoch: b.Epoch, RenewByUnixSeconds: b.Until}
 }

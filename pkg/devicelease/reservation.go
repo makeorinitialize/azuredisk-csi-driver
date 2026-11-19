@@ -36,10 +36,11 @@ import (
 
 const allocationTag = "azuredisk-origin-allocation"
 
-// ProvisioningScope must enforce a dedicated, never-attached slot, exclusively
+// ProvisioningScope must enforce a dedicated, initially unattached slot, exclusively
 // assigned to this journal incarnation for its entire life (including delayed
 // ARM effects). No other journal, CSI client or cloud principal can create,
-// replace, modify or attach it. Hold this guarantee across fn. This is NOT a
+// replace, modify or attach it. The optional controller adapter may attach
+// only for the durable first-owner intent. Hold this guarantee across fn. This is NOT a
 // lease on a previously used disk. Fail if exclusivity/provenance is uncertain.
 type ProvisioningScope interface {
 	Within(context.Context, types.UID, RawPool, func() error) error
@@ -59,8 +60,9 @@ type DiskFactory interface {
 
 type Reservations struct {
 	journal
-	disks reservationDisks
-	scope ProvisioningScope
+	disks  reservationDisks
+	scope  ProvisioningScope
+	attach ControllerAttachment
 }
 
 // NewReservations uses a namespaced client and pins an existing journal by
@@ -76,7 +78,7 @@ func NewReservations(pool RawPool, maps coreclient.ConfigMapInterface, name stri
 	if err != nil || disks == nil {
 		return nil, unavailable(err)
 	}
-	return &Reservations{journal{maps, name, uid, pool}, disks, scope}, nil
+	return &Reservations{journal: journal{maps, name, uid, pool}, disks: disks, scope: scope}, nil
 }
 
 func (r *Reservations) within(ctx context.Context, fn func() error) error {
@@ -97,16 +99,24 @@ func (r *Reservations) within(ctx context.Context, fn func() error) error {
 // Reserve returns a RESERVED binding only. Bytes is the original requested
 // size, not the rounded slot size. Compatible intents converge by composite.
 func (r *Reservations) Reserve(ctx context.Context, requestID, poolID, composite string, bytes uint64) (Binding, error) {
+	v, err := r.reserve(ctx, requestID, poolID, composite, bytes)
+	return v.Binding, err
+}
+
+func (r *Reservations) reserve(ctx context.Context, requestID, poolID, composite string, bytes uint64) (ownerView, error) {
 	if !validID(requestID) || !validID(poolID) || !validID(composite) || bytes == 0 {
-		return Binding{}, status.Error(codes.InvalidArgument, "incomplete reserve intent")
+		return ownerView{}, status.Error(codes.InvalidArgument, "incomplete reserve intent")
 	}
 	intent := reserveIntent{"Reserve", poolID, composite, bytes}
-	var result Binding
+	var result ownerView
 	err := r.within(ctx, func() error {
 		for range 16 {
 			cm, l, err := r.read(ctx)
 			if err != nil {
 				return err
+			}
+			if _, claimed := l.Claims[requestID]; claimed {
+				return status.Error(codes.AlreadyExists, "request ID belongs to Acquire")
 			}
 			if prev, ok := l.Requests[requestID]; ok {
 				if prev != intent {
@@ -127,10 +137,7 @@ func (r *Reservations) Reserve(ctx context.Context, requestID, poolID, composite
 				return status.Error(codes.NotFound, "unknown pool")
 			}
 			if l.First != "" && first.Composite != composite {
-				if l.Phase != "reserved" {
-					return status.Error(codes.Unavailable, "origin provisioning unresolved")
-				}
-				if _, err := r.inspectReserved(ctx, l); err != nil {
+				if _, err := r.current(ctx, cm, l); err != nil {
 					return err
 				}
 				return status.Error(codes.ResourceExhausted, "origin slot already allocated")
@@ -191,8 +198,8 @@ func (r *Reservations) Reserve(ctx context.Context, requestID, poolID, composite
 					return err
 				}
 				l.GUID, l.Phase = *disk.Properties.UniqueID, "reserved"
-			case "reserved":
-				result, err = r.inspectReserved(ctx, l)
+			case "reserved", "active", "attachPrepared", "attaching", "held":
+				result, err = r.current(ctx, cm, l)
 				return err
 			}
 			if _, err := r.save(ctx, cm, l); err != nil {
@@ -202,7 +209,7 @@ func (r *Reservations) Reserve(ctx context.Context, requestID, poolID, composite
 		return status.Error(codes.Unavailable, "origin journal contention")
 	})
 	if err != nil {
-		return Binding{}, err
+		return ownerView{}, err
 	}
 	return result, nil
 }
@@ -215,19 +222,16 @@ func (r *Reservations) Capacity(ctx context.Context, poolID string) (uint64, err
 	}
 	var n uint64
 	err := r.within(ctx, func() error {
-		_, l, err := r.read(ctx)
+		cm, l, err := r.read(ctx)
 		if err != nil {
 			return err
 		}
 		if poolID != r.pool.PoolID {
 			return status.Error(codes.NotFound, "unknown pool")
 		}
-		if l.Phase == "reserved" {
-			_, err = r.inspectReserved(ctx, l)
-			return err
-		}
 		if l.Phase != "free" {
-			return status.Error(codes.Unavailable, "origin provisioning unresolved")
+			_, err = r.current(ctx, cm, l)
+			return err
 		}
 		disk, absent, err := r.get(ctx)
 		if err != nil {
@@ -262,16 +266,17 @@ func (r *Reservations) Capacity(ctx context.Context, poolID string) (uint64, err
 }
 
 func (r *Reservations) Lookup(ctx context.Context, allocationID string) (Binding, error) {
-	return r.lookup(ctx, allocationID, nil)
+	v, err := r.lookup(ctx, allocationID, nil)
+	return v.Binding, err
 }
 
-func (r *Reservations) lookup(ctx context.Context, allocationID string, allowed func(string) bool) (Binding, error) {
+func (r *Reservations) lookup(ctx context.Context, allocationID string, allowed func(string) bool) (ownerView, error) {
 	if !validID(allocationID) {
-		return Binding{}, status.Error(codes.InvalidArgument, "missing allocation ID")
+		return ownerView{}, status.Error(codes.InvalidArgument, "missing allocation ID")
 	}
-	var b Binding
+	var b ownerView
 	err := r.within(ctx, func() error {
-		_, l, err := r.read(ctx)
+		cm, l, err := r.read(ctx)
 		if err != nil {
 			return err
 		}
@@ -283,14 +288,11 @@ func (r *Reservations) lookup(ctx context.Context, allocationID string, allowed 
 		if allowed != nil && !allowed(l.Requests[l.First].Composite) {
 			return status.Error(codes.PermissionDenied, "composite outside client grant")
 		}
-		if l.Phase != "reserved" {
-			return status.Error(codes.Unavailable, "origin provisioning unresolved")
-		}
-		b, err = r.inspectReserved(ctx, l)
+		b, err = r.current(ctx, cm, l)
 		return err
 	})
 	if err != nil {
-		return Binding{}, err
+		return ownerView{}, err
 	}
 	return b, nil
 }
@@ -327,6 +329,16 @@ func (r *Reservations) create(ctx context.Context) error {
 }
 
 func (r *Reservations) verify(d *armcompute.Disk, guid string) error {
+	if err := r.verifyIdentity(d, guid); err != nil {
+		return err
+	}
+	if *d.Properties.DiskState != armcompute.DiskStateUnattached || d.ManagedBy != nil {
+		return status.Error(codes.FailedPrecondition, "origin is not unattached")
+	}
+	return nil
+}
+
+func (r *Reservations) verifyIdentity(d *armcompute.Disk, guid string) error {
 	p := d.Properties
 	if p == nil || p.UniqueID == nil || *p.UniqueID == "" || p.ProvisioningState == nil || !strings.EqualFold(*p.ProvisioningState, "Succeeded") ||
 		p.DiskState == nil || p.DiskSizeBytes == nil || p.CreationData == nil || p.CreationData.CreateOption == nil || d.Location == nil || d.ID == nil {
@@ -340,7 +352,7 @@ func (r *Reservations) verify(d *armcompute.Disk, guid string) error {
 		(r.pool.InventoryGUID == "" && ptr.Deref(d.Tags[allocationTag], "") != r.allocationID()) {
 		return status.Error(codes.FailedPrecondition, "origin provenance or disk incarnation mismatch")
 	}
-	if *p.DiskState != armcompute.DiskStateUnattached || d.ManagedBy != nil || len(d.ManagedByExtended) != 0 ||
+	if len(d.ManagedByExtended) != 0 ||
 		len(p.ShareInfo) != 0 || ptr.Deref(p.MaxShares, 1) != 1 {
 		return status.Error(codes.FailedPrecondition, "disk is not an unused exclusive origin")
 	}
@@ -358,6 +370,5 @@ func (r *Reservations) inspectReserved(ctx context.Context, l *ledger) (Binding,
 	if err := r.verify(d, l.GUID); err != nil {
 		return Binding{}, err
 	}
-	return Binding{AllocationID: r.allocationID(), CompositeID: l.Requests[l.First].Composite, ResourceID: r.pool.ResourceID, DiskUniqueID: l.GUID,
-		DeviceGeneration: 1, CapacityBytes: r.pool.Bytes}, nil
+	return r.binding(l), nil
 }

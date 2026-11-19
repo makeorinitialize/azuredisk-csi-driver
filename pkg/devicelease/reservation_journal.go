@@ -62,12 +62,17 @@ type reserveIntent struct {
 }
 
 type ledger struct {
-	Version  int
-	Pool     RawPool
-	Requests map[string]reserveIntent
-	First    string // original request key; the allocation remains charged
-	Phase    string // free, submitted, reserved; missing is never free
-	GUID     string
+	Version    int
+	Pool       RawPool
+	Requests   map[string]reserveIntent
+	First      string // original request key; the allocation remains charged
+	Phase      string // free, submitted, reserved; missing is never free
+	GUID       string
+	Claims     map[string]attachInput `json:",omitempty"`
+	AttachKey  string                 `json:",omitempty"`
+	TargetVM   string                 `json:",omitempty"`
+	TargetGUID string                 `json:",omitempty"`
+	RenewBy    int64                  `json:",omitempty"`
 }
 
 // InitialJournal is for explicit one-time bootstrap into a NEW provider
@@ -107,7 +112,8 @@ func (j journal) read(ctx context.Context) (*corev1.ConfigMap, *ledger, error) {
 	var l ledger
 	raw := cm.Data[journalKey]
 	strict, err := kjson.UnmarshalStrict([]byte(raw), &l)
-	if !utf8.ValidString(raw) || err != nil || len(strict) != 0 || !l.valid(j.pool) {
+	if !utf8.ValidString(raw) || err != nil || len(strict) != 0 || !l.valid(j.pool) ||
+		(l.AttachKey != "" && l.Claims[l.AttachKey].Binding.AllocationID != j.allocationID()) {
 		return nil, nil, status.Error(codes.Unavailable, "unknown or inconsistent origin journal")
 	}
 	return cm, &l, nil
@@ -122,6 +128,27 @@ func (l *ledger) valid(pool RawPool) bool {
 			return false
 		}
 	}
+	for k, c := range l.Claims {
+		if _, collision := l.Requests[k]; collision || !validID(k) || !c.valid() {
+			return false
+		}
+	}
+	switch l.Phase {
+	case "attachPrepared", "attaching", "active", "held":
+		c, ok := l.Claims[l.AttachKey]
+		if !ok || !validVMID(l.TargetVM) || !validID(l.TargetGUID) || c.Previous != 0 {
+			return false
+		}
+		pending := l.Phase == "attachPrepared" || l.Phase == "attaching"
+		if c.Binding.CompositeID != l.Requests[l.First].Composite || c.Binding.ResourceID != pool.ResourceID || c.Binding.DeviceGeneration != 1 || c.Binding.DiskUniqueID != l.GUID || c.Binding.CapacityBytes != pool.Bytes ||
+			(pending && l.RenewBy != 0) || (!pending && l.RenewBy <= 0) {
+			return false
+		}
+	default:
+		if l.AttachKey != "" || l.TargetVM != "" || l.TargetGUID != "" || l.RenewBy != 0 {
+			return false
+		}
+	}
 	if l.Phase == "free" {
 		return l.First == "" && l.GUID == ""
 	}
@@ -132,6 +159,8 @@ func (l *ledger) valid(pool RawPool) bool {
 	switch l.Phase {
 	case "submitted":
 		return l.GUID == "" && pool.InventoryGUID == ""
+	case "attachPrepared", "attaching", "active", "held":
+		return pool.InventoryGUID != "" && pool.InventoryGUID == l.GUID
 	case "reserved":
 		return validID(l.GUID) && (pool.InventoryGUID == "" || pool.InventoryGUID == l.GUID)
 	default:

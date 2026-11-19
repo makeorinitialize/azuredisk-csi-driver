@@ -28,10 +28,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/utils/ptr"
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/diskclient/mock_diskclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	mockvm "sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachineclient/mock_virtualmachineclient"
 )
 
 type csiAuthority struct {
@@ -116,4 +118,26 @@ func TestOriginAdmissionHeldDuringDelete(t *testing.T) {
 	_, err = d.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{VolumeId: testVolumeID})
 	require.NoError(t, err)
 	require.False(t, a.busy)
+}
+
+func TestOriginFreshVMIdentity(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	f, err := NewFakeDriver(ctrl)
+	require.NoError(t, err)
+	d := &f.(*fakeDriver).Driver
+	id := "/subscriptions/" + d.cloud.SubscriptionID + "/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"
+	vm := &armcompute.VirtualMachine{ID: &id, Properties: &armcompute.VirtualMachineProperties{
+		VMID: ptr.To("vm-instance"), ProvisioningState: ptr.To("Succeeded"), OSProfile: &armcompute.OSProfile{ComputerName: ptr.To("node")},
+		StorageProfile: &armcompute.StorageProfile{DataDisks: []*armcompute.DataDisk{{ManagedDisk: &armcompute.ManagedDiskParameters{ID: &testVolumeID}}}},
+	}}
+	c := d.clientFactory.GetVirtualMachineClient().(*mockvm.MockInterface)
+	c.EXPECT().Get(gomock.Any(), "rg", "vm", nil).Return(vm, nil).Times(2)
+	a := originAttachment{d}
+	got, err := a.readVM(t.Context(), "node", id)
+	require.NoError(t, err)
+	require.Equal(t, id, got.ID)
+	require.Equal(t, "vm-instance", got.InstanceGUID)
+	require.Equal(t, testVolumeID, *got.DataDisks[0].ManagedDisk.ID)
+	_, err = a.readVM(t.Context(), "other-node", id)
+	require.Error(t, err)
 }
