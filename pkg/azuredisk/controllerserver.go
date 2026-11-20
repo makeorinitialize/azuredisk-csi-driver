@@ -105,6 +105,12 @@ func normalizeMutableDiskParameters(parameters map[string]string) (map[string]st
 
 // CreateVolume provisions an azure disk
 func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	if d.onlineConfigPath != "" && d.onlineDomain == nil {
+		return nil, status.Error(codes.Unavailable, "configured online admission is not initialized")
+	}
+	if d.onlineDomain != nil && !d.onlineDomain.NativeAdmitted(ctx) {
+		return nil, status.Error(codes.FailedPrecondition, "online native admission required")
+	}
 	if err := d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		klog.Errorf("invalid create volume req: %v", req)
 		return nil, err
@@ -222,6 +228,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	if diskParams.ResourceGroup == "" {
 		diskParams.ResourceGroup = d.cloud.ResourceGroup
+	}
+	if d.onlineDomain != nil {
+		sub := diskParams.SubscriptionID
+		if sub == "" {
+			sub = localCloud.SubscriptionID
+		}
+		target := fmt.Sprintf(consts.ManagedDiskPath, sub, diskParams.ResourceGroup, diskParams.DiskName)
+		targets := []string{target}
+		if source := req.GetVolumeContentSource().GetVolume(); source != nil {
+			targets = append(targets, source.GetVolumeId())
+		}
+		if err := d.onlineDomain.CheckNativeCreateTargets(ctx, targets...); err != nil {
+			return nil, err
+		}
 	}
 	if d.origin != nil || d.publishedBlock != nil {
 		sub := diskParams.SubscriptionID
@@ -473,7 +493,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-
 	nodeDriven := attachMode == consts.AttachModeNodeDriven
 	if nodeDriven {
 		cachePolicy, err := azureutils.GetCachingMode(diskParams.VolumeContext)
@@ -915,8 +934,8 @@ func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPubli
 		}
 	}
 
-	if d.publishedBlock.Matches(diskURI) {
-		s := d.publishedBlock.Selection()
+	if d.publishedHold(ctx).Matches(diskURI) {
+		s := d.publishedHold(ctx).Selection()
 		if req.Readonly || disk == nil || disk.ID == nil || !strings.EqualFold(*disk.ID, s.ResourceID) || disk.Properties == nil ||
 			ptr.Deref(disk.Properties.UniqueID, "") != s.DiskUniqueID || ptr.Deref(disk.Properties.DiskSizeBytes, 0) != s.CapacityBytes ||
 			ptr.Deref(disk.Properties.MaxShares, 0) != 1 || len(disk.Properties.ShareInfo) != 0 || len(disk.ManagedByExtended) != 0 ||
@@ -1053,7 +1072,7 @@ func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPubli
 		lun, err = d.diskController.AttachDisk(ctx, diskName, diskURI, nodeName, cachingMode, disk, occupiedLuns)
 		if err != nil {
 			if derr, ok := err.(*volerr.DanglingAttachError); ok {
-				if d.publishedBlock.Matches(diskURI) {
+				if d.publishedHold(ctx).Matches(diskURI) {
 					return nil, status.Error(codes.FailedPrecondition, "selected block disk has a dangling attachment")
 				}
 				if strings.EqualFold(string(nodeName), string(derr.CurrentNode)) {

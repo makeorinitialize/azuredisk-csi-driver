@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"strconv"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,11 +32,14 @@ type OpenedBlock struct {
 	Major, Minor uint32
 }
 
-// BlockOpenAuthority resolves the immutable, exclusive open for this peer and
-// owner epoch. Pin that same open file description and its current use by the
-// facade throughout check. Reject closed/reopened or unprovable handles, even
-// when the replacement has the same dev_t and Azure GUID. Invoke check once
-// synchronously and propagate its error; never retry or return cached evidence.
+// BlockOpenAuthority resolves the immutable owner-scoped open for this peer and
+// epoch. Exclusive provider ownership is not a lifetime Linux O_EXCL claim:
+// retain the same independently identified O_RDWR description under the durable
+// use hold, after opening it while a transient exclusive-unused probe is held.
+// Release only that probe before formatter/DM claims, never the registered OFD.
+// Pin the original and the facade's current description throughout check.
+// Reject closed/reopened or unprovable handles, even with the same dev_t/GUID.
+// Invoke check once synchronously and propagate its error; never cache evidence.
 type BlockOpenAuthority interface {
 	WithOpened(context.Context, BlockSelection, [sha256.Size]byte, func(OpenedBlock) error) error
 }
@@ -73,7 +75,7 @@ func (s *reservationRPC) Validate(ctx context.Context, in *pb.ValidateRequest) (
 	// Validate is read-only. In particular it must never acquire, renew or
 	// change the phase (including when it observes an expired deadline).
 	until, err := strconv.ParseInt(cm.Data["deadline"], 10, 64)
-	if cm.Data["phase"] != "held" || err != nil || time.Now().Unix() >= until {
+	if cm.Data["phase"] != "held" || err != nil || h.clock().Unix() >= until {
 		return nil, status.Error(codes.FailedPrecondition, "current live block hold required")
 	}
 	g := ctx.Value(grantContextKey{}).(reservationGrant)
@@ -106,7 +108,7 @@ func (s *reservationRPC) Validate(ctx context.Context, in *pb.ValidateRequest) (
 	if current.ResourceVersion != cm.ResourceVersion {
 		return nil, status.Error(codes.Aborted, "block hold changed during validation")
 	}
-	if time.Now().Unix() >= until {
+	if h.clock().Unix() >= until {
 		return nil, status.Error(codes.FailedPrecondition, "block hold expired during validation")
 	}
 	return &pb.ValidateResponse{}, nil

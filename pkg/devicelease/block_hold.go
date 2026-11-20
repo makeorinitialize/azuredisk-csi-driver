@@ -36,8 +36,9 @@ import (
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 )
 
-// BlockSelection is trusted enrollment for ONE ordinary disposable block PV.
-// Install on every CSI replica before first publication; never rearm/reuse.
+// BlockSelection is trusted immutable enrollment for one ordinary block PV.
+// Static selections precede publication; external selections are resolved under
+// the shared native admission journal. Never reset/reuse an allocation's history.
 type BlockSelection struct {
 	Binding
 	Owner
@@ -64,6 +65,8 @@ type BlockHold struct {
 	uid     types.UID
 	cleanup BlockCleanup
 	opened  BlockOpenAuthority
+	online  *OnlineDomain
+	now     func() time.Time
 }
 
 func InitialBlockHold(s BlockSelection) (map[string]string, error) {
@@ -85,6 +88,13 @@ func NewBlockHold(s BlockSelection, maps coreclient.ConfigMapInterface, name str
 }
 func (h *BlockHold) Selection() BlockSelection { return h.s }
 func (h *BlockHold) Matches(id string) bool    { return h != nil && strings.EqualFold(id, h.s.ResourceID) }
+
+func (h *BlockHold) clock() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
+}
 
 func (h *BlockHold) read(ctx context.Context) (*v1.ConfigMap, error) {
 	cm, err := h.maps.Get(ctx, h.name, metav1.GetOptions{})
@@ -114,6 +124,11 @@ func (h *BlockHold) read(ctx context.Context) (*v1.ConfigMap, error) {
 	}
 	if _, err := blockRenewals(cm); err != nil {
 		return nil, err
+	}
+	if h.online != nil {
+		if err := h.online.checkHold(ctx, cm); err != nil {
+			return nil, err
+		}
 	}
 	return cm, nil
 }
@@ -220,7 +235,7 @@ func (h *BlockHold) acquire(ctx context.Context, key string, b Binding, o Owner,
 	}
 	cm = cm.DeepCopy()
 	cm.Data["acquireID"] = key
-	cm.Data["deadline"] = strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10)
+	cm.Data["deadline"] = strconv.FormatInt(h.clock().Add(time.Minute).Unix(), 10)
 	_, err = h.move(ctx, cm, "held", "")
 	return err
 }
@@ -234,7 +249,7 @@ func (h *BlockHold) live(ctx context.Context, cm *v1.ConfigMap) (bool, error) {
 	if renewals.Pending != nil {
 		until = renewals.Pending.PreviousDeadline
 	}
-	if err == nil && time.Now().Unix() < until {
+	if err == nil && h.clock().Unix() < until {
 		return true, nil
 	}
 	_, err = h.move(ctx, cm, "expired", "")

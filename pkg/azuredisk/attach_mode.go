@@ -33,35 +33,54 @@ import (
 // Ordinary CSI has no origin owner credentials. Hold its admission across the
 // entire call, including QAD and the controller's dangling-attach recovery.
 func (d *Driver) guardDisk(ctx context.Context, rpc proto.Message, diskURI string) (func(), error) {
-	if d.publishedBlock.Matches(diskURI) {
+	if d.onlineConfigPath != "" && d.onlineDomain == nil {
+		return nil, status.Error(codes.Unavailable, "configured online admission is not initialized")
+	}
+	if _, readOnly := rpc.(*csi.NodeGetVolumeStatsRequest); readOnly && d.onlineDomain != nil {
+		if err := d.onlineDomain.AllowNativeRead(ctx, diskURI); err != nil {
+			return nil, err
+		}
+		return func() {}, nil
+	}
+	if d.onlineDomain != nil && !d.onlineDomain.NativeAdmitted(ctx) {
+		return nil, status.Error(codes.FailedPrecondition, "online native admission required")
+	}
+	hold := d.publishedHold(ctx)
+	if hold.Matches(diskURI) {
 		if d.origin != nil {
 			return nil, fmt.Errorf("cannot combine origin and published block modes")
 		}
 		switch q := rpc.(type) {
 		case *csi.ControllerUnpublishVolumeRequest:
-			if q.NodeId != d.publishedBlock.Selection().NodeID {
+			if q.NodeId != hold.Selection().NodeID {
 				return nil, status.Error(codes.FailedPrecondition, "wrong node for selected disk teardown")
 			}
 		case *csi.NodeUnpublishVolumeRequest, *csi.NodeUnstageVolumeRequest:
-			if d.NodeID != d.publishedBlock.Selection().NodeID {
+			if d.NodeID != hold.Selection().NodeID {
 				return nil, status.Error(codes.FailedPrecondition, "wrong node for selected disk teardown")
 			}
 		case *csi.DeleteVolumeRequest:
 		default:
 			return nil, status.Error(codes.FailedPrecondition, "operation not supported for selected block disk")
 		}
-		if err := d.publishedBlock.EnterTeardown(ctx); err != nil {
+		if d.onlineDomain != nil {
+			// Online admission distinguishes verified node-use teardown from
+			// final allocation closure. Never retire an external PVC merely
+			// because its normal native ControllerUnpublish runs.
+			return func() {}, nil
+		}
+		if err := hold.EnterTeardown(ctx); err != nil {
 			return nil, err
 		}
 		return func() {}, nil
 	}
-	if d.publishedBlock != nil {
+	if hold != nil {
 		switch rpc.(type) {
 		case *csi.ControllerPublishVolumeRequest, *csi.ControllerUnpublishVolumeRequest:
 			// These paths can enter VM helpers that also match by basename.
 			// Disk-RP operations use the full ARM ID and do not share this
 			// ambiguity across resource groups or subscriptions.
-			id := d.publishedBlock.Selection().ResourceID
+			id := hold.Selection().ResourceID
 			if strings.EqualFold(diskURI[strings.LastIndexByte(diskURI, '/')+1:], id[strings.LastIndexByte(id, '/')+1:]) {
 				return nil, status.Error(codes.FailedPrecondition, "ambiguous selected disk basename")
 			}

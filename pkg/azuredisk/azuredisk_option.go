@@ -33,6 +33,8 @@ type DriverOptions struct {
 	Origin *devicelease.Origin
 	// PublishedBlock is a separate, one-use guard for an ordinary CSI block PV.
 	PublishedBlock *devicelease.BlockHold
+	// OnlineDomainConfig enables provider-journaled holds on external sources.
+	OnlineDomainConfig string
 	// Common options
 	NodeID                     string
 	DriverName                 string
@@ -96,6 +98,7 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 		return nil
 	}
 	fs := flag.NewFlagSet("", flag.ExitOnError)
+	fs.StringVar(&o.OnlineDomainConfig, "online-block-domain-config", "", "protected JSON config for isolated external-source holds (off by default)")
 	if o.FeatureGates == nil {
 		o.FeatureGates = NewDriverFeatureGate()
 	}

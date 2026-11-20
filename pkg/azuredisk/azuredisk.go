@@ -49,6 +49,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -106,8 +107,11 @@ type hostUtil interface {
 // Driver is the implementation of the Azure Disk CSI Driver.
 type Driver struct {
 	csicommon.CSIDriver
-	origin         *devicelease.Origin
-	publishedBlock *devicelease.BlockHold
+	origin           *devicelease.Origin
+	publishedBlock   *devicelease.BlockHold
+	onlineDomain     *devicelease.OnlineDomain
+	onlineConfigPath string
+	onlineRESTConfig *rest.Config
 	// Embed UnimplementedXXXServer to ensure the driver returns Unimplemented for any
 	// new RPC methods that might be introduced in future versions of the spec.
 	csi.UnimplementedControllerServer
@@ -206,9 +210,14 @@ type Driver struct {
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
 func NewDriver(options *DriverOptions) *Driver {
-	driver := Driver{origin: options.Origin, publishedBlock: options.PublishedBlock}
+	driver := Driver{origin: options.Origin, publishedBlock: options.PublishedBlock, onlineConfigPath: options.OnlineDomainConfig}
 	if options.FeatureGates == nil {
 		options.FeatureGates = NewDriverFeatureGate()
+	}
+	if options.OnlineDomainConfig != "" && (options.Origin != nil || options.PublishedBlock != nil ||
+		options.EnableMigrationMonitor || options.RemoveNotReadyTaint || options.FeatureGates.Enabled(NodeDrivenAttachDetach) || options.FeatureGates.Enabled(KataMount)) {
+		klog.Error("online block canary requires migration monitor, taint removal, QAD, Kata and other origin modes disabled")
+		return nil
 	}
 	driver.Name = options.DriverName
 	driver.Version = driverVersion
@@ -312,6 +321,7 @@ func NewDriver(options *DriverOptions) *Driver {
 		}
 	}
 	driver.kubeClient = kubeClient
+	driver.onlineRESTConfig = kubeConfig
 
 	if driver.NodeID != "" {
 		// Initialize HTTP client for wireserver calls (node component only)
@@ -525,6 +535,10 @@ func (d *Driver) waitForPVInformerCacheSync(ctx context.Context, timeout time.Du
 
 // Run driver initialization
 func (d *Driver) Run(ctx context.Context) error {
+	onlineConfig, err := d.configureOnline(ctx)
+	if err != nil {
+		return err
+	}
 	versionMeta, err := GetVersionYAML(d.Name)
 	if err != nil {
 		klog.Fatalf("%v", err)
@@ -533,6 +547,7 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	opts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(
+			d.onlineNative,
 			grpcprom.NewServerMetrics().UnaryServerInterceptor(),
 			csicommon.LogGRPC,
 		),
@@ -555,6 +570,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	csi.RegisterIdentityServer(s, d)
 	csi.RegisterControllerServer(s, d)
 	csi.RegisterNodeServer(s, d)
+	stopOnline, err := d.startOnline(ctx, onlineConfig, s)
+	if err != nil {
+		return err
+	}
+	defer stopOnline()
 
 	// Start the node informer if it was set up during driver initialization
 	if d.nodeInformerFactory != nil {

@@ -26,9 +26,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// LinuxBlockCustody supplies borrowed, stable handles: the duplicate retained
-// by trusted custody at exclusive open, and an independent duplicate of the
-// authenticated facade's current FD. Keep both and the owner registration
+// LinuxBlockCustody supplies borrowed, stable handles: the original O_RDWR OFD
+// retained under exclusive provider ownership, and an independent duplicate of
+// the authenticated facade's current FD. A transient O_EXCL probe is not the
+// registered original: a lifetime exclusive claim conflicts with mkfs/DM and
+// does not fence ordinary opens. Keep both descriptions and owner registration
 // pinned through check. IdentifyOpened has the existing Session contract.
 type LinuxBlockCustody interface {
 	WithHandles(context.Context, BlockSelection, [sha256.Size]byte, func(registered BlockSelection, retained, current *os.File) error) error

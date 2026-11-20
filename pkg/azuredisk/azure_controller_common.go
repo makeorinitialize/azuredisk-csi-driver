@@ -40,6 +40,7 @@ import (
 
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
@@ -110,6 +111,7 @@ type controllerCommon struct {
 	VMSSDetachTimeoutInSeconds int
 	ForceDetachBackoff         bool
 	noForceDiskID              string
+	onlineDomain               *devicelease.OnlineDomain
 	WaitForDetach              bool
 	CheckDiskCountForBatching  bool
 	// WaitForDetachDiskComplete controls whether detach waits until the disk is no longer managed by the detach target node:
@@ -518,21 +520,30 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
 		if err != nil && c.ForceDetachBackoff {
 			// Batches can be drained by a different caller. Never include a
 			// selected block PV in a force retry, regardless of who drains it.
-			if _, has := diskMap[strings.ToLower(c.noForceDiskID)]; has {
-				delete(diskMap, strings.ToLower(c.noForceDiskID))
-				if len(diskMap) > 0 {
-					if otherErr := vmset.DetachDisk(ctx, nodeName, diskMap, true); otherErr != nil {
-						return otherErr
+			retainCurrent := false
+			for id := range diskMap {
+				allowed := !strings.EqualFold(id, c.noForceDiskID)
+				if c.onlineDomain != nil {
+					var checkErr error
+					allowed, checkErr = c.onlineDomain.ForceRetryAllowed(ctx, id)
+					if checkErr != nil {
+						return checkErr
 					}
 				}
-				if formattedDiskURI == strings.ToLower(c.noForceDiskID) {
-					return err
+				if !allowed {
+					delete(diskMap, id)
+					retainCurrent = retainCurrent || id == formattedDiskURI
 				}
-				err = nil
-			} else {
-				klog.Errorf("azureDisk - DetachDisk(%s) from node %s failed with error: %v, retry with force detach", diskName, nodeName, err)
-				err = vmset.DetachDisk(ctx, nodeName, diskMap, true)
 			}
+			if len(diskMap) > 0 {
+				if otherErr := vmset.DetachDisk(ctx, nodeName, diskMap, true); otherErr != nil {
+					return otherErr
+				}
+			}
+			if retainCurrent {
+				return err
+			}
+			err = nil
 		}
 	}
 

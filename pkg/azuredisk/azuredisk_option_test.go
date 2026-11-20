@@ -31,7 +31,20 @@ func TestDriverOptions_AddFlags(t *testing.T) {
 	got.VisitAll(func(_ *flag.Flag) {
 		count++
 	})
-	if count != typeInfo.NumField() {
-		t.Errorf("DriverOptions.AddFlags() = %v, want %v", count, typeInfo.NumField())
+	// Legacy origin authorities are programmatic hooks, never CLI flags.
+	want := typeInfo.NumField()
+	for _, name := range []string{"Origin", "PublishedBlock"} {
+		if _, ok := typeInfo.FieldByName(name); ok {
+			want--
+		}
+	}
+	if count != want {
+		t.Errorf("DriverOptions.AddFlags() = %v, want %v", count, want)
+	}
+	if err := got.Parse([]string{"--online-block-domain-config=canary.json"}); err != nil {
+		t.Fatal(err)
+	}
+	if o.OnlineDomainConfig != "canary.json" || o.Origin != nil || o.PublishedBlock != nil {
+		t.Fatal("online configuration must be explicit without enabling legacy authorities")
 	}
 }

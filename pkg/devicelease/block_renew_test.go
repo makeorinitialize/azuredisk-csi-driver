@@ -27,6 +27,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,8 +133,20 @@ func (r *blockRenewFixture) restart(t *testing.T) {
 	t.Helper()
 	h, err := NewBlockHold(r.h.s, r.h.maps, r.h.name, r.h.uid, r.h.cleanup)
 	require.NoError(t, err)
+	h.now = r.h.now
 	r.h = h
 	r.client = r.connect(t, ReservationNode, h.s.NodeID)
+}
+
+func (r *blockRenewFixture) controlClock(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	now := new(atomic.Int64)
+	now.Store(time.Now().Unix())
+	copy := *r.h
+	copy.now = func() time.Time { return time.Unix(now.Load(), 0) }
+	r.h = &copy
+	r.client = r.connect(t, ReservationNode, r.h.s.NodeID)
+	return now
 }
 
 func (r *blockRenewFixture) release(t *testing.T, key string) error {
@@ -381,7 +394,8 @@ func TestPublishedBlockRenewLateCandidateNeverRevives(t *testing.T) {
 	for _, mode := range []string{"late-reply", "late-error", "lost-response", "lost-expiry-latch"} {
 		t.Run(mode, func(t *testing.T) {
 			r := newBlockRenewFixture(t)
-			oldDeadline := time.Now().Add(time.Second).Unix()
+			clock := r.controlClock(t)
+			oldDeadline := clock.Load() + 20
 			r.edit(t, func(cm *v1.ConfigMap) { cm.Data["deadline"] = strconv.FormatInt(oldDeadline, 10) })
 			intercept := true
 			lostLatch := false
@@ -395,9 +409,12 @@ func TestPublishedBlockRenewLateCandidateNeverRevives(t *testing.T) {
 					return false, nil, nil
 				}
 				intercept = false
-				require.Equal(t, "renewing", next.Data["phase"])
+				if next.Data["phase"] != "renewing" {
+					t.Errorf("expected renewal candidate, got %s", next.Data["phase"])
+					return true, nil, errUncertain
+				}
 				if mode != "lost-response" {
-					time.Sleep(1100 * time.Millisecond)
+					clock.Store(oldDeadline)
 				}
 				version, err := strconv.Atoi(next.ResourceVersion)
 				require.NoError(t, err)
@@ -412,13 +429,13 @@ func TestPublishedBlockRenewLateCandidateNeverRevives(t *testing.T) {
 			require.Error(t, err)
 			require.Nil(t, result)
 			if mode == "lost-response" {
-				time.Sleep(1100 * time.Millisecond)
+				clock.Store(oldDeadline)
 			}
 			saved := r.state(t)
 			newDeadline, err := strconv.ParseInt(saved.Data["deadline"], 10, 64)
 			require.NoError(t, err)
 			require.Greater(t, newDeadline, oldDeadline, "server persisted candidate's future deadline")
-			require.LessOrEqual(t, oldDeadline, time.Now().Unix())
+			require.LessOrEqual(t, oldDeadline, clock.Load())
 			ledger, err := blockRenewals(saved)
 			require.NoError(t, err)
 			require.NotNil(t, ledger.Pending, "ambiguous deadline is never silently confirmed")
@@ -523,11 +540,13 @@ func TestPublishedBlockRenewExpiryDuringEvidenceOrCommit(t *testing.T) {
 	for _, stage := range []string{"evidence", "commit"} {
 		t.Run(stage, func(t *testing.T) {
 			r := newBlockRenewFixture(t)
+			clock := r.controlClock(t)
+			oldDeadline := clock.Load() + 20
 			r.edit(t, func(cm *v1.ConfigMap) {
-				cm.Data["deadline"] = strconv.FormatInt(time.Now().Add(time.Second).Unix(), 10)
+				cm.Data["deadline"] = strconv.FormatInt(oldDeadline, 10)
 			})
 			if stage == "evidence" {
-				r.observe = func() { time.Sleep(1100 * time.Millisecond) }
+				r.observe = func() { clock.Store(oldDeadline) }
 			} else {
 				intercept := true
 				r.f.client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
@@ -540,7 +559,7 @@ func TestPublishedBlockRenewExpiryDuringEvidenceOrCommit(t *testing.T) {
 					require.NoError(t, err)
 					next.ResourceVersion = strconv.Itoa(version + 1)
 					require.NoError(t, r.f.client.Tracker().Update(action.GetResource(), next, next.Namespace))
-					time.Sleep(1100 * time.Millisecond)
+					clock.Store(oldDeadline)
 					return true, next, nil
 				})
 			}

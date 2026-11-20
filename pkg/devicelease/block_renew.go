@@ -175,7 +175,7 @@ func (s *reservationRPC) Renew(ctx context.Context, in *pb.RenewRequest) (*pb.Le
 	}
 	if !replay {
 		until, _ := strconv.ParseInt(current.Data["deadline"], 10, 64)
-		deadline := max(until, time.Now().Add(time.Minute).Unix())
+		deadline := max(until, h.clock().Add(time.Minute).Unix())
 		ledger.Requests[digest] = blockRenewal{Input: input, Deadline: deadline}
 		ledger.Pending = &blockRenewalPending{Request: digest, PreviousDeadline: until}
 		data, err := json.Marshal(ledger)
@@ -215,7 +215,7 @@ func (s *reservationRPC) Renew(ctx context.Context, in *pb.RenewRequest) (*pb.Le
 		}
 	}
 	until, _ := strconv.ParseInt(current.Data["deadline"], 10, 64)
-	if time.Now().Unix() >= until {
+	if h.clock().Unix() >= until {
 		_, err = h.live(ctx, current)
 		if err != nil {
 			return nil, err

@@ -44,7 +44,10 @@ type blockSetupRequest interface {
 }
 
 func runBlockSetup[Q blockSetupRequest, R any](ctx context.Context, d *Driver, q Q, node string, publish bool, run func(context.Context, Q) (*R, error)) (*R, error) {
-	h := d.publishedBlock
+	if d.onlineDomain != nil && !d.onlineDomain.NativeAdmitted(ctx) {
+		return nil, status.Error(codes.FailedPrecondition, "online native admission required")
+	}
+	h := d.publishedHold(ctx)
 	if !h.Matches(q.GetVolumeId()) {
 		end, err := d.guardDisk(ctx, q, q.GetVolumeId())
 		if err != nil {
@@ -85,7 +88,8 @@ func (d *Driver) verifyBlockPV(ctx context.Context, s devicelease.BlockSelection
 		return status.Error(codes.Unavailable, "enrolled PV unavailable")
 	}
 	src, ref := pv.Spec.CSI, pv.Spec.ClaimRef
-	if string(pv.UID) != s.PVUID || pv.DeletionTimestamp != nil || pv.Status.Phase != v1.VolumeBound || pv.Annotations["pv.kubernetes.io/provisioned-by"] != d.Name ||
+	if string(pv.UID) != s.PVUID || pv.DeletionTimestamp != nil || pv.Status.Phase != v1.VolumeBound ||
+		d.onlineDomain == nil && pv.Annotations["pv.kubernetes.io/provisioned-by"] != d.Name ||
 		src == nil || src.Driver != d.Name || !strings.EqualFold(src.VolumeHandle, s.ResourceID) || src.ReadOnly || d.hasQADInfo(pv) ||
 		ptr.Deref(pv.Spec.VolumeMode, v1.PersistentVolumeFilesystem) != v1.PersistentVolumeBlock || len(pv.Spec.AccessModes) != 1 || pv.Spec.AccessModes[0] != v1.ReadWriteOnce ||
 		ref == nil || ref.Name != s.PVC || ref.Namespace != s.Namespace || string(ref.UID) != s.PVCUID {
@@ -128,6 +132,7 @@ func (d *Driver) observeBlock(ctx context.Context, s devicelease.BlockSelection)
 	if err := d.verifyBlockPV(ctx, s); err != nil {
 		return nil, devicelease.TargetVM{}, err
 	}
+
 	if d.diskController == nil || d.cloud == nil || d.clientFactory == nil {
 		return nil, devicelease.TargetVM{}, status.Error(codes.Unavailable, "controller not initialized")
 	}
@@ -138,6 +143,24 @@ func (d *Driver) observeBlock(ctx context.Context, s devicelease.BlockSelection)
 	disk, err := d.diskController.GetDiskByURI(ctx, s.ResourceID)
 	if err != nil {
 		return nil, vm, status.Error(codes.Unavailable, "enrolled disk unavailable")
+	}
+	return disk, vm, nil
+}
+
+// Existing ownership is not contingent on source API objects surviving. The
+// retained VM/disk identities still require fresh independent Azure evidence;
+// missing resources or changed incarnations are uncertainty, never release.
+func (d *Driver) observeRetainedBlock(ctx context.Context, s devicelease.BlockSelection) (*armcompute.Disk, devicelease.TargetVM, error) {
+	if d.diskController == nil || d.cloud == nil || d.clientFactory == nil {
+		return nil, devicelease.TargetVM{}, status.Error(codes.Unavailable, "controller not initialized")
+	}
+	vm, err := (originAttachment{d}).readVM(ctx, s.NodeID, s.VMID)
+	if err != nil {
+		return nil, vm, status.Error(codes.Unavailable, "retained VM unavailable")
+	}
+	disk, err := d.diskController.GetDiskByURI(ctx, s.ResourceID)
+	if err != nil {
+		return nil, vm, status.Error(codes.Unavailable, "retained disk unavailable")
 	}
 	return disk, vm, nil
 }
