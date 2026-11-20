@@ -136,7 +136,7 @@ func InitialOnlineDomain(i OnlineIdentity) (map[string]string, error) {
 	if !i.valid() {
 		return nil, status.Error(codes.InvalidArgument, "incomplete external source domain")
 	}
-	b, err := json.Marshal(onlineRecord{Version: 1, Identity: i})
+	b, err := json.Marshal(onlineRecord{Version: 2, Identity: i})
 	return map[string]string{onlineDomainKey: string(b)}, err
 }
 func NewOnlineDomain(i OnlineIdentity, maps coreclient.ConfigMapInterface, name string, uid types.UID, kube kubernetes.Interface, dyn dynamic.Interface) (*OnlineDomain, error) {
@@ -154,7 +154,7 @@ func (d *OnlineDomain) read(ctx context.Context) (*core.ConfigMap, onlineRecord,
 	}
 	bad := status.Error(codes.Unavailable, "external hold journal unavailable or incompatible")
 	if cm == nil || cm.UID != d.uid || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || len(cm.Data[onlineDomainKey]) > 768*1024 ||
-		json.Unmarshal([]byte(cm.Data[onlineDomainKey]), &r) != nil || r.Version != 1 || !r.Identity.same(d.identity) {
+		json.Unmarshal([]byte(cm.Data[onlineDomainKey]), &r) != nil || r.Version != 2 || !r.Identity.same(d.identity) {
 		return nil, r, bad
 	}
 	data, _ := json.Marshal(r)
@@ -162,6 +162,9 @@ func (d *OnlineDomain) read(ctx context.Context) (*core.ConfigMap, onlineRecord,
 		return nil, r, bad
 	}
 	if r.Selection != nil {
+		if err := checkBlockHoldData(cm); err != nil {
+			return nil, r, err
+		}
 		s := r.Selection
 		spec, _ := json.Marshal(s)
 		if !s.valid() || cm.Data["selection.v1"] != string(spec) || r.CompositeID != s.CompositeID || r.Owner != r.Backing.Owner ||
@@ -172,6 +175,12 @@ func (d *OnlineDomain) read(ctx context.Context) (*core.ConfigMap, onlineRecord,
 			r.Backing.Cache.Driver != d.identity.Backing.EffectiveCacheDriver() ||
 			s.AllocationID != "external-"+blockRequestDigest(string(d.uid)+"\x00"+r.Owner) {
 			return nil, r, bad
+		}
+	} else {
+		for _, key := range []string{"hold-policy.v1", "deadline", "phase", "receipt", "acquireID", "releaseID", "renewals.v1"} {
+			if _, exists := cm.Data[key]; exists {
+				return nil, r, bad
+			}
 		}
 	}
 	if r.ReleaseID != "" && (!r.Closed || r.ReleaseInput == "") {
@@ -401,7 +410,7 @@ func (d *OnlineDomain) EndNative(ctx context.Context, success bool, resultID str
 		var conflict *nativeJournalConflict
 		if errors.As(err, &conflict) {
 			// Reread the entire current object, preserving concurrent hold
-			// and renewal history. Never invoke the native handler again.
+			// and release history. Never invoke the native handler again.
 			continue
 		}
 		// A lost/unknown reply may conceal a committed completion. Reconcile
@@ -434,7 +443,7 @@ func (d *OnlineDomain) hold(r onlineRecord) *BlockHold {
 }
 func (d *OnlineDomain) checkHold(ctx context.Context, cm *core.ConfigMap) error {
 	var r onlineRecord
-	if json.Unmarshal([]byte(cm.Data[onlineDomainKey]), &r) != nil || r.Version != 1 || !r.Identity.same(d.identity) {
+	if json.Unmarshal([]byte(cm.Data[onlineDomainKey]), &r) != nil || r.Version != 2 || !r.Identity.same(d.identity) {
 		return status.Error(codes.Unavailable, "external hold domain unavailable")
 	}
 	data, _ := json.Marshal(r)
@@ -571,5 +580,6 @@ func (d *OnlineDomain) reserve(ctx context.Context, in *pb.ReserveRequest, obser
 }
 func (d *OnlineDomain) reservedLease(r onlineRecord) *pb.Lease {
 	b := &publishedRPC{h: d.hold(r)}
-	return &pb.Lease{Allocation: b.allocation(), PoolId: d.identity.PoolID, CapacityBytes: uint64(r.Selection.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED}
+	return &pb.Lease{Allocation: b.allocation(), PoolId: d.identity.PoolID, CapacityBytes: uint64(r.Selection.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED,
+		HoldPolicy: pb.HoldPolicy_HOLD_POLICY_EXPLICIT_RELEASE}
 }

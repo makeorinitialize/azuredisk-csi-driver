@@ -15,8 +15,8 @@ option go_package = "sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease/api/v1;dev
 // changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
 // but must never repeat a committed effect, even after restart or deletion.
 // Reserve replays return the current state of the same allocation (including
-// HELD). Acquire/Renew replays return the current snapshot only for the same
-// active owner (stale incarnation: ABORTED; expired owner: FAILED_PRECONDITION).
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
 // Release replays acknowledge history ONLY.
 //
 // Errors have no usable output: INVALID_ARGUMENT for malformed input,
@@ -45,9 +45,9 @@ service DeviceProvider {
   // exclusive device and its attestation to independent provider evidence.
   // Neither echoing the Lease nor matching a path or dev_t alone is proof.
   rpc Validate(ValidateRequest) returns (ValidateResponse);
-  // Extend only a still-current ACQUIRED owner. Replaying a successful renew
-  // does not extend the deadline again.
-  rpc Renew(RenewRequest) returns (Lease);
+  // Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+  // return FAILED_PRECONDITION without changing ownership or admission.
+  rpc Renew(RenewRequest) returns (Lease) { option deprecated = true; }
   rpc Release(ReleaseRequest) returns (ReleaseAck);
   // Current authoritative state; a deleted allocation yields NOT_FOUND.
   rpc GetLease(LeaseKey) returns (Lease);
@@ -96,7 +96,12 @@ enum LeaseState {
   LEASE_STATE_UNSPECIFIED = 0;
   LEASE_STATE_RESERVED = 1; // No node access; capacity remains charged.
   LEASE_STATE_ACQUIRED = 2;
-  LEASE_STATE_HELD = 3;     // Liveness expired; owner retained, IO not authorized.
+  LEASE_STATE_HELD = 3;     // Quarantined; owner retained, new IO not authorized.
+}
+
+enum HoldPolicy {
+  HOLD_POLICY_UNSPECIFIED = 0;
+  HOLD_POLICY_EXPLICIT_RELEASE = 1;
 }
 
 message Lease {
@@ -106,11 +111,15 @@ message Lease {
   LeaseState state = 4;
   string node_id = 5;        // Empty only in RESERVED.
   uint64 owner_epoch = 6;    // High-water mark, initially 0; never reset on unstage.
-  int64 renew_by_unix_seconds = 7; // Provider clock; at deadline ACQUIRED -> HELD.
+  int64 renew_by_unix_seconds = 7; // Legacy deadline; MUST be zero for EXPLICIT_RELEASE.
   // Advisory hints only, absent/default in RESERVED. Never open a caller path.
   string observed_device_path = 8;
   uint32 observed_major = 9;
   uint32 observed_minor = 10;
+  // Required even for RESERVED. Retain ownership until explicit verified
+  // release; time, disconnect and process exit never authorize reuse.
+  // Unspecified/timed owners cannot be upgraded by interpreting a zero deadline.
+  HoldPolicy hold_policy = 11;
 }
 
 message AcquireRequest {

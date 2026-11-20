@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"strconv"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -98,33 +97,19 @@ func (b *publishedRPC) lookup(ctx context.Context, k *pb.LeaseKey) (*pb.Lease, e
 	if err != nil {
 		return nil, err
 	}
-	l := &pb.Lease{Allocation: a, CapacityBytes: uint64(s.CapacityBytes), PoolId: s.PoolID, State: pb.LeaseState_LEASE_STATE_RESERVED}
+	l := &pb.Lease{Allocation: a, CapacityBytes: uint64(s.CapacityBytes), PoolId: s.PoolID, State: pb.LeaseState_LEASE_STATE_RESERVED,
+		HoldPolicy: pb.HoldPolicy_HOLD_POLICY_EXPLICIT_RELEASE}
 	switch cm.Data["phase"] {
 	case "released":
 		l.OwnerEpoch = s.Epoch
 	case "published":
-	case "expired", "held":
+	case "held":
 		l.NodeId, l.OwnerEpoch = s.NodeID, s.Epoch
-		l.RenewByUnixSeconds, err = strconv.ParseInt(cm.Data["deadline"], 10, 64)
-		if err != nil {
-			return nil, unavailable(err)
+		// Retained authorization does not itself prove current attachment.
+		if err = b.h.acquire(ctx, cm.Data["acquireID"], s.Binding, s.Owner, b.observe); err != nil {
+			return nil, err
 		}
-		l.State = pb.LeaseState_LEASE_STATE_HELD
-		if cm.Data["phase"] == "held" {
-			live, err := b.h.live(ctx, cm)
-			if err != nil {
-				return nil, err
-			}
-			if !live {
-				return l, nil
-			}
-			// A stored hold is not by itself evidence that the disk is still
-			// attached to the expected VM.
-			if err = b.h.acquire(ctx, cm.Data["acquireID"], s.Binding, s.Owner, b.observe); err != nil {
-				return nil, err
-			}
-			l.State = pb.LeaseState_LEASE_STATE_ACQUIRED
-		}
+		l.State = pb.LeaseState_LEASE_STATE_ACQUIRED
 	default:
 		return nil, status.Error(codes.Unavailable, "block publication not available")
 	}

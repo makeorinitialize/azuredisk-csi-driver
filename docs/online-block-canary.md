@@ -80,6 +80,14 @@ The facade must use the same namespace/node/driver scope and explicit wire IDs
 before sealing its external source snapshot. Provider class/byte restrictions
 are optional; actual values come from the exactly pinned source objects.
 This bootstrap initializes only the provider hold journal, not any source PVC.
+New journals use internal domain version 2 and explicit-release block policy.
+Do not upgrade/reset old timed or unmarked journals in place: they are
+quarantined, including old selected reservations. The facade and ACS provider
+must both support `Lease.hold_policy=HOLD_POLICY_EXPLICIT_RELEASE` (field 11)
+with zero deadlines. No periodic renewal component is required or supported;
+native detach remains blocked until independently verified node-use release.
+The current online adapter still has no installed physical open/cleanup
+authority, so Validate/NODE Release remain fail-closed rather than simulated.
 
 For an offline bootstrap manifest, save this small program as
 `canary-bootstrap/main.go` in an operator checkout. It prints only the initial

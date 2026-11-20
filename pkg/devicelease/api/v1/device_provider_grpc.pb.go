@@ -43,8 +43,8 @@ const (
 // changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
 // but must never repeat a committed effect, even after restart or deletion.
 // Reserve replays return the current state of the same allocation (including
-// HELD). Acquire/Renew replays return the current snapshot only for the same
-// active owner (stale incarnation: ABORTED; expired owner: FAILED_PRECONDITION).
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
 // Release replays acknowledge history ONLY.
 //
 // Errors have no usable output: INVALID_ARGUMENT for malformed input,
@@ -73,8 +73,9 @@ type DeviceProviderClient interface {
 	// exclusive device and its attestation to independent provider evidence.
 	// Neither echoing the Lease nor matching a path or dev_t alone is proof.
 	Validate(ctx context.Context, in *ValidateRequest, opts ...grpc.CallOption) (*ValidateResponse, error)
-	// Extend only a still-current ACQUIRED owner. Replaying a successful renew
-	// does not extend the deadline again.
+	// Deprecated: Do not use.
+	// Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+	// return FAILED_PRECONDITION without changing ownership or admission.
 	Renew(ctx context.Context, in *RenewRequest, opts ...grpc.CallOption) (*Lease, error)
 	Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseAck, error)
 	// Current authoritative state; a deleted allocation yields NOT_FOUND.
@@ -129,6 +130,7 @@ func (c *deviceProviderClient) Validate(ctx context.Context, in *ValidateRequest
 	return out, nil
 }
 
+// Deprecated: Do not use.
 func (c *deviceProviderClient) Renew(ctx context.Context, in *RenewRequest, opts ...grpc.CallOption) (*Lease, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Lease)
@@ -174,8 +176,8 @@ func (c *deviceProviderClient) GetLease(ctx context.Context, in *LeaseKey, opts 
 // changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
 // but must never repeat a committed effect, even after restart or deletion.
 // Reserve replays return the current state of the same allocation (including
-// HELD). Acquire/Renew replays return the current snapshot only for the same
-// active owner (stale incarnation: ABORTED; expired owner: FAILED_PRECONDITION).
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
 // Release replays acknowledge history ONLY.
 //
 // Errors have no usable output: INVALID_ARGUMENT for malformed input,
@@ -204,8 +206,9 @@ type DeviceProviderServer interface {
 	// exclusive device and its attestation to independent provider evidence.
 	// Neither echoing the Lease nor matching a path or dev_t alone is proof.
 	Validate(context.Context, *ValidateRequest) (*ValidateResponse, error)
-	// Extend only a still-current ACQUIRED owner. Replaying a successful renew
-	// does not extend the deadline again.
+	// Deprecated: Do not use.
+	// Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+	// return FAILED_PRECONDITION without changing ownership or admission.
 	Renew(context.Context, *RenewRequest) (*Lease, error)
 	Release(context.Context, *ReleaseRequest) (*ReleaseAck, error)
 	// Current authoritative state; a deleted allocation yields NOT_FOUND.

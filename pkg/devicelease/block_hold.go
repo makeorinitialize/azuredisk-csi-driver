@@ -20,9 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"google.golang.org/grpc/codes"
@@ -66,7 +64,6 @@ type BlockHold struct {
 	cleanup BlockCleanup
 	opened  BlockOpenAuthority
 	online  *OnlineDomain
-	now     func() time.Time
 }
 
 func InitialBlockHold(s BlockSelection) (map[string]string, error) {
@@ -77,7 +74,7 @@ func InitialBlockHold(s BlockSelection) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]string{"selection.v1": string(spec), "phase": "selected", "receipt": ""}, nil
+	return map[string]string{"selection.v1": string(spec), "hold-policy.v1": "explicit-release", "deadline": "0", "phase": "selected", "receipt": ""}, nil
 }
 
 func NewBlockHold(s BlockSelection, maps coreclient.ConfigMapInterface, name string, uid types.UID, cleanup BlockCleanup) (*BlockHold, error) {
@@ -89,13 +86,6 @@ func NewBlockHold(s BlockSelection, maps coreclient.ConfigMapInterface, name str
 func (h *BlockHold) Selection() BlockSelection { return h.s }
 func (h *BlockHold) Matches(id string) bool    { return h != nil && strings.EqualFold(id, h.s.ResourceID) }
 
-func (h *BlockHold) clock() time.Time {
-	if h.now != nil {
-		return h.now()
-	}
-	return time.Now()
-}
-
 func (h *BlockHold) read(ctx context.Context) (*v1.ConfigMap, error) {
 	cm, err := h.maps.Get(ctx, h.name, metav1.GetOptions{})
 	if err != nil {
@@ -105,24 +95,7 @@ func (h *BlockHold) read(ctx context.Context) (*v1.ConfigMap, error) {
 	if cm == nil || cm.UID != h.uid || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Data["selection.v1"] != string(spec) {
 		return nil, status.Error(codes.Unavailable, "block hold incarnation unavailable")
 	}
-	receipt, ok := cm.Data["receipt"]
-	if !ok || (cm.Data["phase"] == "released") != (receipt != "") {
-		return nil, status.Error(codes.Unavailable, "inconsistent block cleanup history")
-	}
-	switch cm.Data["phase"] {
-	case "held", "renewing", "expired", "released":
-		until, err := strconv.ParseInt(cm.Data["deadline"], 10, 64)
-		if err != nil || until <= 0 || !validID(cm.Data["acquireID"]) || (cm.Data["phase"] == "released") != (cm.Data["releaseID"] != "") || cm.Data["acquireID"] == cm.Data["releaseID"] {
-			return nil, status.Error(codes.Unavailable, "inconsistent block owner history")
-		}
-	case "selected", "setup", "published", "teardown":
-		if cm.Data["acquireID"] != "" || cm.Data["releaseID"] != "" || cm.Data["deadline"] != "" {
-			return nil, status.Error(codes.Unavailable, "unexpected block owner history")
-		}
-	default:
-		return nil, status.Error(codes.Unavailable, "unknown block hold phase")
-	}
-	if _, err := blockRenewals(cm); err != nil {
+	if err := checkBlockHoldData(cm); err != nil {
 		return nil, err
 	}
 	if h.online != nil {
@@ -131,6 +104,34 @@ func (h *BlockHold) read(ctx context.Context) (*v1.ConfigMap, error) {
 		}
 	}
 	return cm, nil
+}
+
+// Never upgrade an old timed or unmarked journal into durable authorization.
+// The same check gates native admission, not just provider RPCs.
+func checkBlockHoldData(cm *v1.ConfigMap) error {
+	if cm.Data["hold-policy.v1"] != "explicit-release" || cm.Data["deadline"] != "0" {
+		return status.Error(codes.Unavailable, "explicit-release block journal required; legacy state quarantined")
+	}
+	if _, exists := cm.Data["renewals.v1"]; exists {
+		return status.Error(codes.Unavailable, "legacy renewal history quarantined")
+	}
+	receipt, ok := cm.Data["receipt"]
+	if !ok || (cm.Data["phase"] == "released") != (receipt != "") {
+		return status.Error(codes.Unavailable, "inconsistent block cleanup history")
+	}
+	switch cm.Data["phase"] {
+	case "held", "released":
+		if !validID(cm.Data["acquireID"]) || (cm.Data["phase"] == "released") != (cm.Data["releaseID"] != "") || cm.Data["acquireID"] == cm.Data["releaseID"] {
+			return status.Error(codes.Unavailable, "inconsistent block owner history")
+		}
+	case "selected", "setup", "published", "teardown":
+		if cm.Data["acquireID"] != "" || cm.Data["releaseID"] != "" {
+			return status.Error(codes.Unavailable, "unexpected block owner history")
+		}
+	default:
+		return status.Error(codes.Unavailable, "unknown block hold phase")
+	}
+	return nil
 }
 func (h *BlockHold) move(ctx context.Context, cm *v1.ConfigMap, phase, receipt string) (*v1.ConfigMap, error) {
 	next := cm.DeepCopy()
@@ -200,11 +201,7 @@ func (h *BlockHold) acquire(ctx context.Context, key string, b Binding, o Owner,
 	if err != nil {
 		return err
 	}
-	renewals, err := blockRenewals(cm)
-	if err != nil {
-		return err
-	}
-	if key == cm.Data["releaseID"] || renewals.Requests[blockRequestDigest(key)].Deadline != 0 {
+	if key == cm.Data["releaseID"] {
 		return status.Error(codes.AlreadyExists, "key belongs to another block operation")
 	}
 	if cm.Data["acquireID"] != "" && cm.Data["acquireID"] != key {
@@ -224,36 +221,12 @@ func (h *BlockHold) acquire(ctx context.Context, key string, b Binding, o Owner,
 		if cm.ResourceVersion != current.ResourceVersion {
 			return status.Error(codes.Aborted, "block hold changed during replay")
 		}
-		live, err := h.live(ctx, current)
-		if err != nil {
-			return err
-		}
-		if !live {
-			return status.Error(codes.FailedPrecondition, "block hold expired; cleanup still required")
-		}
 		return nil
 	}
 	cm = cm.DeepCopy()
 	cm.Data["acquireID"] = key
-	cm.Data["deadline"] = strconv.FormatInt(h.clock().Add(time.Minute).Unix(), 10)
 	_, err = h.move(ctx, cm, "held", "")
 	return err
-}
-
-func (h *BlockHold) live(ctx context.Context, cm *v1.ConfigMap) (bool, error) {
-	until, err := strconv.ParseInt(cm.Data["deadline"], 10, 64)
-	renewals, ledgerErr := blockRenewals(cm)
-	if ledgerErr != nil {
-		return false, ledgerErr
-	}
-	if renewals.Pending != nil {
-		until = renewals.Pending.PreviousDeadline
-	}
-	if err == nil && h.clock().Unix() < until {
-		return true, nil
-	}
-	_, err = h.move(ctx, cm, "expired", "")
-	return false, err
 }
 
 func (h *BlockHold) verifyPublished(ctx context.Context, observe BlockObserver) error {
@@ -291,17 +264,13 @@ func (h *BlockHold) release(ctx context.Context, key string, b Binding, o Owner,
 	if err != nil {
 		return err
 	}
-	renewals, err := blockRenewals(cm)
-	if err != nil {
-		return err
-	}
-	if cm.Data["acquireID"] == key || renewals.Requests[blockRequestDigest(key)].Deadline != 0 || (cm.Data["releaseID"] == key && cm.Data["receipt"] != receipt) {
+	if cm.Data["acquireID"] == key || (cm.Data["releaseID"] == key && cm.Data["receipt"] != receipt) {
 		return status.Error(codes.AlreadyExists, "key bound to different request")
 	}
 	if cm.Data["phase"] == "released" && cm.Data["receipt"] == receipt && cm.Data["releaseID"] == key {
 		return nil
 	}
-	if (cm.Data["phase"] != "held" && cm.Data["phase"] != "renewing" && cm.Data["phase"] != "expired") || h.cleanup == nil {
+	if cm.Data["phase"] != "held" || h.cleanup == nil {
 		return status.Error(codes.FailedPrecondition, "no releasable hold or cleanup verifier")
 	}
 	if err = h.cleanup.VerifyCleanup(ctx, h.s, receipt); err != nil {

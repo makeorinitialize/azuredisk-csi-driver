@@ -24,7 +24,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -68,7 +67,7 @@ func TestPublishedBlockCrossResourceGroupDiskOperations(t *testing.T) {
 				VMID: fmt.Sprintf("/subscriptions/%s/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm1", d.cloud.SubscriptionID), VMGUID: "vm-guid"}
 			data, err := devicelease.InitialBlockHold(s)
 			require.NoError(t, err)
-			data["phase"], data["acquireID"], data["deadline"] = "held", "acquire", strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10)
+			data["phase"], data["acquireID"] = "held", "acquire"
 			store := &holdMap{cm: &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "hold", UID: "uid", ResourceVersion: "1"}, Data: data}}
 			d.publishedBlock, err = devicelease.NewBlockHold(s, store, "hold", "uid", nil)
 			require.NoError(t, err)

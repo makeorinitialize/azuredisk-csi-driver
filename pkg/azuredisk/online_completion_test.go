@@ -16,7 +16,6 @@ package azuredisk
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -90,10 +89,10 @@ func TestOnlineNativeCompletionRetriesCASWithoutRepeatingHandler(t *testing.T) {
 	base := f.kube.CoreV1().ConfigMaps("ns")
 	var injected atomic.Bool
 	var completionWrites atomic.Int32
-	var renewClient pb.DeviceProviderClient
+	var nodeClient pb.DeviceProviderClient
 	var owner *pb.Owner
 	ready := make(chan struct{})
-	renewResult := make(chan *pb.Lease, 1)
+	acquireResult := make(chan *pb.Lease, 1)
 	maps := &completionMapClient{ConfigMapInterface: base, before: func(ctx context.Context, next *core.ConfigMap) {
 		var record struct {
 			Busy       json.RawMessage
@@ -116,26 +115,19 @@ func TestOnlineNativeCompletionRetriesCASWithoutRepeatingHandler(t *testing.T) {
 		if effects.Load() != 1 {
 			t.Errorf("completion preceded native effect")
 		}
-		renewed, err := renewClient.Renew(ctx, &pb.RenewRequest{RequestId: "between-end-get-and-cas", Owner: owner})
+		acquired, err := nodeClient.Acquire(ctx, &pb.AcquireRequest{RequestId: "between-end-get-and-cas", Owner: owner})
 		if err != nil {
-			t.Errorf("interleaved Renew failed: %v", err)
+			t.Errorf("interleaved Acquire failed: %v", err)
 		}
-		renewResult <- renewed
+		acquireResult <- acquired
 	}}
 	f.d.kubeClient = completionClient{Interface: f.kube, core: completionCore{CoreV1Interface: f.kube.CoreV1(), maps: maps}}
 	native, controller := f.start(t)
 	lease, err := controller.Reserve(t.Context(), &pb.ReserveRequest{RequestId: "reserve-origin", CompositeVolumeId: f.id,
 		Pool: &pb.Pool{Provider: f.cfg.Identity.ProviderID, PoolId: f.cfg.Identity.PoolID}, CapacityBytes: 1 << 30})
 	require.NoError(t, err)
-	renewClient = f.provider(t, f.nodeCert)
+	nodeClient = f.provider(t, f.nodeCert)
 	owner = &pb.Owner{Allocation: lease.Allocation, NodeId: "vm1", OwnerEpoch: 1}
-	_, err = renewClient.Acquire(t.Context(), &pb.AcquireRequest{RequestId: "acquire", Owner: owner})
-	require.NoError(t, err)
-	cm, err := base.Get(t.Context(), "online", metav1.GetOptions{})
-	require.NoError(t, err)
-	cm.Data["deadline"] = strconv.FormatInt(time.Now().Add(20*time.Second).Unix(), 10)
-	_, err = base.Update(t.Context(), cm, metav1.UpdateOptions{})
-	require.NoError(t, err)
 	close(ready)
 	callCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -144,9 +136,9 @@ func TestOnlineNativeCompletionRetriesCASWithoutRepeatingHandler(t *testing.T) {
 	require.Equal(t, int32(1), effects.Load())
 	require.True(t, injected.Load())
 	require.Equal(t, int32(2), completionWrites.Load(), "only the losing completion CAS is retried")
-	renewed := <-renewResult
-	require.NotNil(t, renewed)
-	cm, err = base.Get(t.Context(), "online", metav1.GetOptions{})
+	acquired := <-acquireResult
+	require.NotNil(t, acquired)
+	cm, err := base.Get(t.Context(), "online", metav1.GetOptions{})
 	require.NoError(t, err)
 	var state struct {
 		Busy       *json.RawMessage
@@ -155,10 +147,12 @@ func TestOnlineNativeCompletionRetriesCASWithoutRepeatingHandler(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(cm.Data["external-domain.v1"]), &state))
 	require.Nil(t, state.Busy)
 	require.NotNil(t, state.LastNative)
-	require.Equal(t, strconv.FormatInt(renewed.RenewByUnixSeconds, 10), cm.Data["deadline"])
-	require.Contains(t, cm.Data, "renewals.v1")
+	require.Equal(t, "0", cm.Data["deadline"])
+	require.Equal(t, "explicit-release", cm.Data["hold-policy.v1"])
+	require.NotContains(t, cm.Data, "renewals.v1")
+	require.Equal(t, "between-end-get-and-cas", cm.Data["acquireID"])
 	require.Equal(t, "held", cm.Data["phase"])
-	replay, err := renewClient.Renew(t.Context(), &pb.RenewRequest{RequestId: "between-end-get-and-cas", Owner: owner})
+	replay, err := nodeClient.Acquire(t.Context(), &pb.AcquireRequest{RequestId: "between-end-get-and-cas", Owner: owner})
 	require.NoError(t, err)
-	require.Equal(t, renewed.RenewByUnixSeconds, replay.RenewByUnixSeconds)
+	require.Equal(t, acquired, replay)
 }

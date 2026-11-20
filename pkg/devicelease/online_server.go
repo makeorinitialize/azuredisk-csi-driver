@@ -250,11 +250,7 @@ func (s *onlineRPC) Release(ctx context.Context, in *pb.ReleaseRequest) (*pb.Rel
 		}
 		return &pb.ReleaseAck{}, nil
 	}
-	l, err := blockRenewals(cm)
-	if err != nil {
-		return nil, err
-	}
-	if in.RequestId == r.ReserveID || in.RequestId == cm.Data["acquireID"] || in.RequestId == cm.Data["releaseID"] || l.Requests[blockRequestDigest(in.RequestId)].Deadline != 0 {
+	if in.RequestId == r.ReserveID || in.RequestId == cm.Data["acquireID"] || in.RequestId == cm.Data["releaseID"] {
 		return nil, status.Error(codes.AlreadyExists, "request key belongs to another operation")
 	}
 	if r.Busy != nil {

@@ -259,7 +259,7 @@ func TestOnlineNativePublicationThenRetainedOwnerSurvivesMetadataDeletion(t *tes
 	_, err = node.Acquire(t.Context(), acquire)
 	require.NoError(t, err)
 	_, err = node.Renew(t.Context(), &pb.RenewRequest{RequestId: "renew", Owner: owner})
-	require.NoError(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	_, err = controller.Release(t.Context(), &pb.ReleaseRequest{RequestId: "too-early", Allocation: l.Allocation, Mode: pb.ReleaseMode_RELEASE_MODE_ALLOCATION, OwnerEpoch: 1})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err), "absence never releases held ownership")
 	_, r, err := f.d.read(t.Context())

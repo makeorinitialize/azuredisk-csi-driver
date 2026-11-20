@@ -27,7 +27,7 @@ const (
 	LeaseState_LEASE_STATE_UNSPECIFIED LeaseState = 0
 	LeaseState_LEASE_STATE_RESERVED    LeaseState = 1 // No node access; capacity remains charged.
 	LeaseState_LEASE_STATE_ACQUIRED    LeaseState = 2
-	LeaseState_LEASE_STATE_HELD        LeaseState = 3 // Liveness expired; owner retained, IO not authorized.
+	LeaseState_LEASE_STATE_HELD        LeaseState = 3 // Quarantined; owner retained, new IO not authorized.
 )
 
 // Enum value maps for LeaseState.
@@ -73,6 +73,52 @@ func (LeaseState) EnumDescriptor() ([]byte, []int) {
 	return file_device_provider_proto_rawDescGZIP(), []int{0}
 }
 
+type HoldPolicy int32
+
+const (
+	HoldPolicy_HOLD_POLICY_UNSPECIFIED      HoldPolicy = 0
+	HoldPolicy_HOLD_POLICY_EXPLICIT_RELEASE HoldPolicy = 1
+)
+
+// Enum value maps for HoldPolicy.
+var (
+	HoldPolicy_name = map[int32]string{
+		0: "HOLD_POLICY_UNSPECIFIED",
+		1: "HOLD_POLICY_EXPLICIT_RELEASE",
+	}
+	HoldPolicy_value = map[string]int32{
+		"HOLD_POLICY_UNSPECIFIED":      0,
+		"HOLD_POLICY_EXPLICIT_RELEASE": 1,
+	}
+)
+
+func (x HoldPolicy) Enum() *HoldPolicy {
+	p := new(HoldPolicy)
+	*p = x
+	return p
+}
+
+func (x HoldPolicy) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (HoldPolicy) Descriptor() protoreflect.EnumDescriptor {
+	return file_device_provider_proto_enumTypes[1].Descriptor()
+}
+
+func (HoldPolicy) Type() protoreflect.EnumType {
+	return &file_device_provider_proto_enumTypes[1]
+}
+
+func (x HoldPolicy) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use HoldPolicy.Descriptor instead.
+func (HoldPolicy) EnumDescriptor() ([]byte, []int) {
+	return file_device_provider_proto_rawDescGZIP(), []int{1}
+}
+
 type ReleaseMode int32
 
 const (
@@ -106,11 +152,11 @@ func (x ReleaseMode) String() string {
 }
 
 func (ReleaseMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_device_provider_proto_enumTypes[1].Descriptor()
+	return file_device_provider_proto_enumTypes[2].Descriptor()
 }
 
 func (ReleaseMode) Type() protoreflect.EnumType {
-	return &file_device_provider_proto_enumTypes[1]
+	return &file_device_provider_proto_enumTypes[2]
 }
 
 func (x ReleaseMode) Number() protoreflect.EnumNumber {
@@ -119,7 +165,7 @@ func (x ReleaseMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReleaseMode.Descriptor instead.
 func (ReleaseMode) EnumDescriptor() ([]byte, []int) {
-	return file_device_provider_proto_rawDescGZIP(), []int{1}
+	return file_device_provider_proto_rawDescGZIP(), []int{2}
 }
 
 // Opaque provider-selected capacity/topology domain (not a device path).
@@ -493,13 +539,17 @@ type Lease struct {
 	State              LeaseState             `protobuf:"varint,4,opt,name=state,proto3,enum=dmstack.provider.v1.LeaseState" json:"state,omitempty"`
 	NodeId             string                 `protobuf:"bytes,5,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                                          // Empty only in RESERVED.
 	OwnerEpoch         uint64                 `protobuf:"varint,6,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"`                             // High-water mark, initially 0; never reset on unstage.
-	RenewByUnixSeconds int64                  `protobuf:"varint,7,opt,name=renew_by_unix_seconds,json=renewByUnixSeconds,proto3" json:"renew_by_unix_seconds,omitempty"` // Provider clock; at deadline ACQUIRED -> HELD.
+	RenewByUnixSeconds int64                  `protobuf:"varint,7,opt,name=renew_by_unix_seconds,json=renewByUnixSeconds,proto3" json:"renew_by_unix_seconds,omitempty"` // Legacy deadline; MUST be zero for EXPLICIT_RELEASE.
 	// Advisory hints only, absent/default in RESERVED. Never open a caller path.
 	ObservedDevicePath string `protobuf:"bytes,8,opt,name=observed_device_path,json=observedDevicePath,proto3" json:"observed_device_path,omitempty"`
 	ObservedMajor      uint32 `protobuf:"varint,9,opt,name=observed_major,json=observedMajor,proto3" json:"observed_major,omitempty"`
 	ObservedMinor      uint32 `protobuf:"varint,10,opt,name=observed_minor,json=observedMinor,proto3" json:"observed_minor,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Required even for RESERVED. Retain ownership until explicit verified
+	// release; time, disconnect and process exit never authorize reuse.
+	// Unspecified/timed owners cannot be upgraded by interpreting a zero deadline.
+	HoldPolicy    HoldPolicy `protobuf:"varint,11,opt,name=hold_policy,json=holdPolicy,proto3,enum=dmstack.provider.v1.HoldPolicy" json:"hold_policy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Lease) Reset() {
@@ -600,6 +650,13 @@ func (x *Lease) GetObservedMinor() uint32 {
 		return x.ObservedMinor
 	}
 	return 0
+}
+
+func (x *Lease) GetHoldPolicy() HoldPolicy {
+	if x != nil {
+		return x.HoldPolicy
+	}
+	return HoldPolicy_HOLD_POLICY_UNSPECIFIED
 }
 
 type AcquireRequest struct {
@@ -1043,7 +1100,7 @@ const file_device_provider_proto_rawDesc = "" +
 	"allocation\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
 	"\vowner_epoch\x18\x03 \x01(\x04R\n" +
-	"ownerEpoch\"\xac\x03\n" +
+	"ownerEpoch\"\xee\x03\n" +
 	"\x05Lease\x12?\n" +
 	"\n" +
 	"allocation\x18\x01 \x01(\v2\x1f.dmstack.provider.v1.AllocationR\n" +
@@ -1058,7 +1115,9 @@ const file_device_provider_proto_rawDesc = "" +
 	"\x14observed_device_path\x18\b \x01(\tR\x12observedDevicePath\x12%\n" +
 	"\x0eobserved_major\x18\t \x01(\rR\robservedMajor\x12%\n" +
 	"\x0eobserved_minor\x18\n" +
-	" \x01(\rR\robservedMinor\"\x93\x01\n" +
+	" \x01(\rR\robservedMinor\x12@\n" +
+	"\vhold_policy\x18\v \x01(\x0e2\x1f.dmstack.provider.v1.HoldPolicyR\n" +
+	"holdPolicy\"\x93\x01\n" +
 	"\x0eAcquireRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x120\n" +
@@ -1096,17 +1155,21 @@ const file_device_provider_proto_rawDesc = "" +
 	"\x17LEASE_STATE_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14LEASE_STATE_RESERVED\x10\x01\x12\x18\n" +
 	"\x14LEASE_STATE_ACQUIRED\x10\x02\x12\x14\n" +
-	"\x10LEASE_STATE_HELD\x10\x03*_\n" +
+	"\x10LEASE_STATE_HELD\x10\x03*K\n" +
+	"\n" +
+	"HoldPolicy\x12\x1b\n" +
+	"\x17HOLD_POLICY_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cHOLD_POLICY_EXPLICIT_RELEASE\x10\x01*_\n" +
 	"\vReleaseMode\x12\x1c\n" +
 	"\x18RELEASE_MODE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11RELEASE_MODE_NODE\x10\x01\x12\x1b\n" +
-	"\x17RELEASE_MODE_ALLOCATION\x10\x022\xaa\x04\n" +
+	"\x17RELEASE_MODE_ALLOCATION\x10\x022\xaf\x04\n" +
 	"\x0eDeviceProvider\x12G\n" +
 	"\vGetCapacity\x12\x19.dmstack.provider.v1.Pool\x1a\x1d.dmstack.provider.v1.Capacity\x12J\n" +
 	"\aReserve\x12#.dmstack.provider.v1.ReserveRequest\x1a\x1a.dmstack.provider.v1.Lease\x12J\n" +
 	"\aAcquire\x12#.dmstack.provider.v1.AcquireRequest\x1a\x1a.dmstack.provider.v1.Lease\x12W\n" +
-	"\bValidate\x12$.dmstack.provider.v1.ValidateRequest\x1a%.dmstack.provider.v1.ValidateResponse\x12F\n" +
-	"\x05Renew\x12!.dmstack.provider.v1.RenewRequest\x1a\x1a.dmstack.provider.v1.Lease\x12O\n" +
+	"\bValidate\x12$.dmstack.provider.v1.ValidateRequest\x1a%.dmstack.provider.v1.ValidateResponse\x12K\n" +
+	"\x05Renew\x12!.dmstack.provider.v1.RenewRequest\x1a\x1a.dmstack.provider.v1.Lease\"\x03\x88\x02\x01\x12O\n" +
 	"\aRelease\x12#.dmstack.provider.v1.ReleaseRequest\x1a\x1f.dmstack.provider.v1.ReleaseAck\x12E\n" +
 	"\bGetLease\x12\x1d.dmstack.provider.v1.LeaseKey\x1a\x1a.dmstack.provider.v1.LeaseBJZHsigs.k8s.io/azuredisk-csi-driver/pkg/devicelease/api/v1;deviceproviderv1b\x06proto3"
 
@@ -1122,57 +1185,59 @@ func file_device_provider_proto_rawDescGZIP() []byte {
 	return file_device_provider_proto_rawDescData
 }
 
-var file_device_provider_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_device_provider_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_device_provider_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_device_provider_proto_goTypes = []any{
 	(LeaseState)(0),          // 0: dmstack.provider.v1.LeaseState
-	(ReleaseMode)(0),         // 1: dmstack.provider.v1.ReleaseMode
-	(*Pool)(nil),             // 2: dmstack.provider.v1.Pool
-	(*Capacity)(nil),         // 3: dmstack.provider.v1.Capacity
-	(*ReserveRequest)(nil),   // 4: dmstack.provider.v1.ReserveRequest
-	(*LeaseKey)(nil),         // 5: dmstack.provider.v1.LeaseKey
-	(*Allocation)(nil),       // 6: dmstack.provider.v1.Allocation
-	(*Owner)(nil),            // 7: dmstack.provider.v1.Owner
-	(*Lease)(nil),            // 8: dmstack.provider.v1.Lease
-	(*AcquireRequest)(nil),   // 9: dmstack.provider.v1.AcquireRequest
-	(*OpenedDevice)(nil),     // 10: dmstack.provider.v1.OpenedDevice
-	(*ValidateRequest)(nil),  // 11: dmstack.provider.v1.ValidateRequest
-	(*ValidateResponse)(nil), // 12: dmstack.provider.v1.ValidateResponse
-	(*RenewRequest)(nil),     // 13: dmstack.provider.v1.RenewRequest
-	(*ReleaseRequest)(nil),   // 14: dmstack.provider.v1.ReleaseRequest
-	(*ReleaseAck)(nil),       // 15: dmstack.provider.v1.ReleaseAck
+	(HoldPolicy)(0),          // 1: dmstack.provider.v1.HoldPolicy
+	(ReleaseMode)(0),         // 2: dmstack.provider.v1.ReleaseMode
+	(*Pool)(nil),             // 3: dmstack.provider.v1.Pool
+	(*Capacity)(nil),         // 4: dmstack.provider.v1.Capacity
+	(*ReserveRequest)(nil),   // 5: dmstack.provider.v1.ReserveRequest
+	(*LeaseKey)(nil),         // 6: dmstack.provider.v1.LeaseKey
+	(*Allocation)(nil),       // 7: dmstack.provider.v1.Allocation
+	(*Owner)(nil),            // 8: dmstack.provider.v1.Owner
+	(*Lease)(nil),            // 9: dmstack.provider.v1.Lease
+	(*AcquireRequest)(nil),   // 10: dmstack.provider.v1.AcquireRequest
+	(*OpenedDevice)(nil),     // 11: dmstack.provider.v1.OpenedDevice
+	(*ValidateRequest)(nil),  // 12: dmstack.provider.v1.ValidateRequest
+	(*ValidateResponse)(nil), // 13: dmstack.provider.v1.ValidateResponse
+	(*RenewRequest)(nil),     // 14: dmstack.provider.v1.RenewRequest
+	(*ReleaseRequest)(nil),   // 15: dmstack.provider.v1.ReleaseRequest
+	(*ReleaseAck)(nil),       // 16: dmstack.provider.v1.ReleaseAck
 }
 var file_device_provider_proto_depIdxs = []int32{
-	2,  // 0: dmstack.provider.v1.ReserveRequest.pool:type_name -> dmstack.provider.v1.Pool
-	5,  // 1: dmstack.provider.v1.Allocation.key:type_name -> dmstack.provider.v1.LeaseKey
-	6,  // 2: dmstack.provider.v1.Owner.allocation:type_name -> dmstack.provider.v1.Allocation
-	6,  // 3: dmstack.provider.v1.Lease.allocation:type_name -> dmstack.provider.v1.Allocation
+	3,  // 0: dmstack.provider.v1.ReserveRequest.pool:type_name -> dmstack.provider.v1.Pool
+	6,  // 1: dmstack.provider.v1.Allocation.key:type_name -> dmstack.provider.v1.LeaseKey
+	7,  // 2: dmstack.provider.v1.Owner.allocation:type_name -> dmstack.provider.v1.Allocation
+	7,  // 3: dmstack.provider.v1.Lease.allocation:type_name -> dmstack.provider.v1.Allocation
 	0,  // 4: dmstack.provider.v1.Lease.state:type_name -> dmstack.provider.v1.LeaseState
-	7,  // 5: dmstack.provider.v1.AcquireRequest.owner:type_name -> dmstack.provider.v1.Owner
-	7,  // 6: dmstack.provider.v1.ValidateRequest.owner:type_name -> dmstack.provider.v1.Owner
-	10, // 7: dmstack.provider.v1.ValidateRequest.opened:type_name -> dmstack.provider.v1.OpenedDevice
-	7,  // 8: dmstack.provider.v1.RenewRequest.owner:type_name -> dmstack.provider.v1.Owner
-	6,  // 9: dmstack.provider.v1.ReleaseRequest.allocation:type_name -> dmstack.provider.v1.Allocation
-	1,  // 10: dmstack.provider.v1.ReleaseRequest.mode:type_name -> dmstack.provider.v1.ReleaseMode
-	2,  // 11: dmstack.provider.v1.DeviceProvider.GetCapacity:input_type -> dmstack.provider.v1.Pool
-	4,  // 12: dmstack.provider.v1.DeviceProvider.Reserve:input_type -> dmstack.provider.v1.ReserveRequest
-	9,  // 13: dmstack.provider.v1.DeviceProvider.Acquire:input_type -> dmstack.provider.v1.AcquireRequest
-	11, // 14: dmstack.provider.v1.DeviceProvider.Validate:input_type -> dmstack.provider.v1.ValidateRequest
-	13, // 15: dmstack.provider.v1.DeviceProvider.Renew:input_type -> dmstack.provider.v1.RenewRequest
-	14, // 16: dmstack.provider.v1.DeviceProvider.Release:input_type -> dmstack.provider.v1.ReleaseRequest
-	5,  // 17: dmstack.provider.v1.DeviceProvider.GetLease:input_type -> dmstack.provider.v1.LeaseKey
-	3,  // 18: dmstack.provider.v1.DeviceProvider.GetCapacity:output_type -> dmstack.provider.v1.Capacity
-	8,  // 19: dmstack.provider.v1.DeviceProvider.Reserve:output_type -> dmstack.provider.v1.Lease
-	8,  // 20: dmstack.provider.v1.DeviceProvider.Acquire:output_type -> dmstack.provider.v1.Lease
-	12, // 21: dmstack.provider.v1.DeviceProvider.Validate:output_type -> dmstack.provider.v1.ValidateResponse
-	8,  // 22: dmstack.provider.v1.DeviceProvider.Renew:output_type -> dmstack.provider.v1.Lease
-	15, // 23: dmstack.provider.v1.DeviceProvider.Release:output_type -> dmstack.provider.v1.ReleaseAck
-	8,  // 24: dmstack.provider.v1.DeviceProvider.GetLease:output_type -> dmstack.provider.v1.Lease
-	18, // [18:25] is the sub-list for method output_type
-	11, // [11:18] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	1,  // 5: dmstack.provider.v1.Lease.hold_policy:type_name -> dmstack.provider.v1.HoldPolicy
+	8,  // 6: dmstack.provider.v1.AcquireRequest.owner:type_name -> dmstack.provider.v1.Owner
+	8,  // 7: dmstack.provider.v1.ValidateRequest.owner:type_name -> dmstack.provider.v1.Owner
+	11, // 8: dmstack.provider.v1.ValidateRequest.opened:type_name -> dmstack.provider.v1.OpenedDevice
+	8,  // 9: dmstack.provider.v1.RenewRequest.owner:type_name -> dmstack.provider.v1.Owner
+	7,  // 10: dmstack.provider.v1.ReleaseRequest.allocation:type_name -> dmstack.provider.v1.Allocation
+	2,  // 11: dmstack.provider.v1.ReleaseRequest.mode:type_name -> dmstack.provider.v1.ReleaseMode
+	3,  // 12: dmstack.provider.v1.DeviceProvider.GetCapacity:input_type -> dmstack.provider.v1.Pool
+	5,  // 13: dmstack.provider.v1.DeviceProvider.Reserve:input_type -> dmstack.provider.v1.ReserveRequest
+	10, // 14: dmstack.provider.v1.DeviceProvider.Acquire:input_type -> dmstack.provider.v1.AcquireRequest
+	12, // 15: dmstack.provider.v1.DeviceProvider.Validate:input_type -> dmstack.provider.v1.ValidateRequest
+	14, // 16: dmstack.provider.v1.DeviceProvider.Renew:input_type -> dmstack.provider.v1.RenewRequest
+	15, // 17: dmstack.provider.v1.DeviceProvider.Release:input_type -> dmstack.provider.v1.ReleaseRequest
+	6,  // 18: dmstack.provider.v1.DeviceProvider.GetLease:input_type -> dmstack.provider.v1.LeaseKey
+	4,  // 19: dmstack.provider.v1.DeviceProvider.GetCapacity:output_type -> dmstack.provider.v1.Capacity
+	9,  // 20: dmstack.provider.v1.DeviceProvider.Reserve:output_type -> dmstack.provider.v1.Lease
+	9,  // 21: dmstack.provider.v1.DeviceProvider.Acquire:output_type -> dmstack.provider.v1.Lease
+	13, // 22: dmstack.provider.v1.DeviceProvider.Validate:output_type -> dmstack.provider.v1.ValidateResponse
+	9,  // 23: dmstack.provider.v1.DeviceProvider.Renew:output_type -> dmstack.provider.v1.Lease
+	16, // 24: dmstack.provider.v1.DeviceProvider.Release:output_type -> dmstack.provider.v1.ReleaseAck
+	9,  // 25: dmstack.provider.v1.DeviceProvider.GetLease:output_type -> dmstack.provider.v1.Lease
+	19, // [19:26] is the sub-list for method output_type
+	12, // [12:19] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_device_provider_proto_init() }
@@ -1185,7 +1250,7 @@ func file_device_provider_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_device_provider_proto_rawDesc), len(file_device_provider_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,

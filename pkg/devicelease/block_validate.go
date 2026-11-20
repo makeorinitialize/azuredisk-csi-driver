@@ -19,7 +19,6 @@ package devicelease
 import (
 	"context"
 	"crypto/sha256"
-	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -72,11 +71,9 @@ func (s *reservationRPC) Validate(ctx context.Context, in *pb.ValidateRequest) (
 	if err != nil {
 		return nil, err
 	}
-	// Validate is read-only. In particular it must never acquire, renew or
-	// change the phase (including when it observes an expired deadline).
-	until, err := strconv.ParseInt(cm.Data["deadline"], 10, 64)
-	if cm.Data["phase"] != "held" || err != nil || h.clock().Unix() >= until {
-		return nil, status.Error(codes.FailedPrecondition, "current live block hold required")
+	// Validate is read-only; only explicit release ends this owner's hold.
+	if cm.Data["phase"] != "held" {
+		return nil, status.Error(codes.FailedPrecondition, "current explicit-release block hold required")
 	}
 	g := ctx.Value(grantContextKey{}).(reservationGrant)
 	checked := false
@@ -107,9 +104,6 @@ func (s *reservationRPC) Validate(ctx context.Context, in *pb.ValidateRequest) (
 	}
 	if current.ResourceVersion != cm.ResourceVersion {
 		return nil, status.Error(codes.Aborted, "block hold changed during validation")
-	}
-	if h.clock().Unix() >= until {
-		return nil, status.Error(codes.FailedPrecondition, "block hold expired during validation")
 	}
 	return &pb.ValidateResponse{}, nil
 }

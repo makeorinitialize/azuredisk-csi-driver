@@ -8,7 +8,9 @@ contain a compatible ext4 filesystem; the cache is an existing raw block
 source. This provider does not format either source, create a backing PVC, or
 delete a source PVC/PV/VolumeAttachment/disk when a composite is deleted.
 
-The DeviceProvider v1 wire protocol is unchanged. `Reserve` resolves exact
+DeviceProvider v1 adds `Lease.hold_policy` at field 11 without renumbering
+existing fields. All external-source leases, including RESERVED, advertise
+`HOLD_POLICY_EXPLICIT_RELEASE` and a zero `renew_by_unix_seconds`. `Reserve` resolves exact
 external identities and establishes a durable use authorization; it is not a
 disk creation request. The source must have explicit `maxShares=1`, stable disk
 GUID/size and consistent independent Azure disk/VM observations. An existing
@@ -85,6 +87,16 @@ replace, restore or reuse an old journal; exclude unguarded replicas and
 out-of-band mutations. The runtime writes only its journal, never source
 metadata or finalizers.
 
+The record under `external-domain.v1` now requires internal `Version: 2`.
+Selected block journals require `hold-policy.v1=explicit-release` and
+`deadline=0` in every phase. Old domain versions, missing/unknown policy,
+nonzero deadlines, renewal history, and old renewing/expired phases are
+quarantined without rewriting, releasing, detaching or reusing the source.
+Even an old selected journal with no owner is not silently upgraded. There is
+no automatic migration; do not reset retained old state to bypass this check.
+Coordinate this protocol change with the facade and cache provider before use;
+the previous deadline-requiring facade is incompatible.
+
 All relevant native CSI mutations cross a resourceVersion-CAS Begin/End
 barrier, including work admitted before registration. Unconfirmed effects or
 completion retain busy state, without TTL recovery. Ordinary unrelated native requests
@@ -95,7 +107,7 @@ No-force protection remains for the selected disk, including mixed batches.
 After a successful native handler, only an actual Kubernetes resourceVersion
 conflict retries completion CAS. Each attempt rereads the full current object,
 checks the exact operation token/method/input/target and preserves concurrent
-renewal/hold history; the handler is never rerun by this retry. Completion
+acquisition/release history; the handler is never rerun by this retry. Completion
 records the native result digest alongside clearing Busy. A lost/unknown reply
 is reconciled by reading that exact completion receipt, not by repeating the
 write or physical effect. A historical match acknowledges only that operation,
@@ -111,16 +123,18 @@ that expected attachment. The composite controller coordinates that native
 attachment; a Bound PVC by itself is not a stage or device grant.
 
 The provider journal retains the complete external snapshot and immutable
-allocation/disk/VM/owner identity. Existing-owner lookup, replay, renewal and
+allocation/disk/VM/owner identity. Existing-owner lookup, replay and
 cleanup do not depend on source API objects surviving. Fresh admission still
 requires all live exact source pins. Retained-owner physical observations read
 the pinned Azure resource IDs directly; absence, replacement or uncertainty
 never releases a hold. No new source finalizers are required by this adapter.
 
-Expiry latches HELD and keeps teardown/reclaim blocked. `Renew` can extend only
-the exact live owner and replays never extend twice. Its bounded request history
-and pending-candidate confirmation preserve lost-ACK safety. There is no
-automatic expiry fencer and no recovery from an expired owner into new use.
+Holds do not expire and require no renewal or periodic supervisor. Elapsed time,
+disconnects and process reconstruction cannot revoke the owner or admit a
+successor. `Renew` is deprecated and returns FAILED_PRECONDITION for an exact
+explicit-release owner, without changing state. Authentication, exact node/epoch
+checks and fresh independent attachment/custody evidence remain mandatory;
+certificate validity is not a lease timer. Unknown effects remain retained.
 
 ### Node-use release is not allocation closure
 
@@ -170,8 +184,9 @@ physical readiness.
 
 `InitialBlockHold`, `NewBlockHold`, `WithOpenedAuthority`,
 `NewPublishedBlockServer` and the ordinary setup/teardown guards remain available
-for explicitly pre-enrolled static selections. Preserve journal UID and all
-owner/renewal history. Expired and uncertain work remains retained.
+for explicitly pre-enrolled static selections, now with the same explicit-release
+policy marker and zero deadline. Preserve journal UID and all owner/release
+history. Old timed static journals fail closed, not migrated or released.
 
 The legacy raw-reservation and `Origin` APIs remain separate programmatic
 experiments, off by default. `NewReservations` requires pinned inventory,
@@ -184,6 +199,12 @@ The superseded automatic backing-PVC creation/provenance experiment (including
 its detailed docs/tests) is preserved in
 `experiments/automatic-backing-pvc-before-external-sources.zip`, with per-file
 SHA-256 manifest. It is not compiled or referenced by the external-source path.
+
+The superseded timed block renewal implementation/tests are preserved in
+`experiments/timed-block-renewal-before-explicit-release.zip`, with their source
+commit and per-file SHA-256 manifest. They are not compiled. Raw-reservation
+and `Origin` experiments retain their separate legacy timed semantics; an
+unspecified wire policy there is never explicit-release authority.
 
 Tests use local authenticated gRPC and fake Kubernetes/Azure state. Real guest
 kernel/formatter/DM qualification establishes mechanism compatibility under a

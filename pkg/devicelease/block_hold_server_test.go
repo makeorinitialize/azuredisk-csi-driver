@@ -91,12 +91,26 @@ func TestPublishedBlockWire(t *testing.T) {
 	key := &pb.LeaseKey{Provider: s.Provider, LeaseId: s.AllocationID}
 	initial, err := client.GetLease(ctx, key)
 	require.NoError(t, err)
+	require.Equal(t, pb.HoldPolicy_HOLD_POLICY_EXPLICIT_RELEASE, initial.HoldPolicy)
+	require.Zero(t, initial.RenewByUnixSeconds)
 	req := &pb.AcquireRequest{RequestId: "acquire", Owner: &pb.Owner{Allocation: initial.Allocation, NodeId: "wrong", OwnerEpoch: s.Epoch}}
 	_, err = client.Acquire(ctx, req)
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 	req.Owner.NodeId = s.NodeID
 	active, err := client.Acquire(ctx, req)
 	require.NoError(t, err)
+	require.Equal(t, pb.HoldPolicy_HOLD_POLICY_EXPLICIT_RELEASE, active.HoldPolicy)
+	require.Zero(t, active.RenewByUnixSeconds)
+	_, err = client.Renew(ctx, &pb.RenewRequest{RequestId: "renew", Owner: req.Owner})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	wrong := proto.CloneOf(req.Owner)
+	wrong.NodeId = "wrong"
+	_, err = client.Renew(ctx, &pb.RenewRequest{RequestId: "renew", Owner: wrong})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	staleRenew := proto.CloneOf(req.Owner)
+	staleRenew.OwnerEpoch++
+	_, err = client.Renew(ctx, &pb.RenewRequest{RequestId: "renew", Owner: staleRenew})
+	require.Equal(t, codes.Aborted, status.Code(err))
 	again, err := client.Acquire(ctx, req)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(active, again))
