@@ -249,10 +249,18 @@ spec:
             - "--enable-otel-tracing={{ .Values.controller.otelTracing.enabled }}"
             - "--check-disk-lun-collision=true"
             - "--vmss-detach-timeout-seconds={{ .Values.controller.VMSSDetachTimeoutInSeconds }}"
+            {{- if .Values.deviceUse.enabled }}
+            - "--device-use-config={{ .Values.deviceUse.configPath }}"
+            {{- end }}
             {{- range $value := .Values.controller.extraArgs }}
             - {{ $value | quote }}
             {{- end }}
           ports:
+            {{- if .Values.deviceUse.enabled }}
+            - containerPort: {{ .Values.controller.deviceUsePort }}
+              name: device-use
+              protocol: TCP
+            {{- end }}
             - containerPort: {{ .Values.controller.metricsPort }}
               name: metrics
               protocol: TCP

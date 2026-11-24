@@ -99,6 +99,7 @@ controller:
   podAnnotations: {}
   extraVolumeMounts: []
   extraVolumes: []
+  deviceUsePort: 9710
   nodeSelector: {}
   affinity: {}
   resources:
@@ -237,6 +238,7 @@ linux:
   podAnnotations: {}
   extraVolumeMounts: []
   extraVolumes: []
+  extraArgs: []
   nodeSelector: {}
   affinity: {}
   nodeAffinity:
@@ -317,6 +319,11 @@ windows:
         memory: 40Mi
 
 cloud: AzurePublicCloud
+
+deviceUse:
+  enabled: false
+  configPath: /etc/compositedisk-origin/domain.json
+  journalConfigMap: compositedisk-deviceuse-origin
 
 ## Reference to one or more secrets to be used when pulling images
 ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/

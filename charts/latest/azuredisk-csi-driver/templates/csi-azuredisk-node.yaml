@@ -157,6 +157,12 @@ spec:
             - "--enable-otel-tracing={{ .Values.linux.otelTracing.enabled }}"
             - "--metrics-address=0.0.0.0:{{ .Values.node.metricsPort }}"
             - "--remove-not-ready-taint={{ .Values.node.removeNotReadyTaint }}"
+            {{- if .Values.deviceUse.enabled }}
+            - "--device-use-config={{ .Values.deviceUse.configPath }}"
+            {{- end }}
+            {{- range $value := .Values.linux.extraArgs }}
+            - {{ $value | quote }}
+            {{- end }}
 {{- if ne .Values.node.hostNetwork true }}
           ports:
             - containerPort: {{ .Values.node.livenessProbe.healthPort }}
