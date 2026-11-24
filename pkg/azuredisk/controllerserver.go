@@ -105,12 +105,10 @@ func normalizeMutableDiskParameters(parameters map[string]string) (map[string]st
 
 // CreateVolume provisions an azure disk
 func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
-	if d.onlineConfigPath != "" && d.onlineDomain == nil {
-		return nil, status.Error(codes.Unavailable, "configured online admission is not initialized")
-	}
-	if d.onlineDomain != nil && !d.onlineDomain.NativeAdmitted(ctx) {
-		return nil, status.Error(codes.FailedPrecondition, "online native admission required")
-	}
+	return runUseOperation(ctx, d, req, "CreateVolume", d.createVolume)
+}
+
+func (d *Driver) createVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	if err := d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		klog.Errorf("invalid create volume req: %v", req)
 		return nil, err
@@ -229,7 +227,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if diskParams.ResourceGroup == "" {
 		diskParams.ResourceGroup = d.cloud.ResourceGroup
 	}
-	if d.onlineDomain != nil {
+	if d.useDomain != nil {
 		sub := diskParams.SubscriptionID
 		if sub == "" {
 			sub = localCloud.SubscriptionID
@@ -239,30 +237,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if source := req.GetVolumeContentSource().GetVolume(); source != nil {
 			targets = append(targets, source.GetVolumeId())
 		}
-		if err := d.onlineDomain.CheckNativeCreateTargets(ctx, targets...); err != nil {
-			return nil, err
-		}
-	}
-	if d.origin != nil || d.publishedBlock != nil {
-		sub := diskParams.SubscriptionID
-		if sub == "" {
-			sub = localCloud.SubscriptionID
-		}
-		ids := []string{fmt.Sprintf(consts.ManagedDiskPath, sub, diskParams.ResourceGroup, diskParams.DiskName)}
-		if src := req.GetVolumeContentSource().GetVolume(); src != nil {
-			ids = append(ids, src.GetVolumeId())
-		}
-		for _, id := range ids {
-			if d.publishedBlock.Matches(id) {
-				return nil, status.Error(codes.FailedPrecondition, "block selection is for an already provisioned disk")
-			}
-		}
-		if d.origin != nil {
-			end, err := d.origin.BeginCSI(ctx, req, ids...)
+		for _, id := range targets {
+			_, _, err := d.useDomain.BeginNative(ctx, "CreateVolume", id, "")
 			if err != nil {
 				return nil, err
 			}
-			defer end()
 		}
 	}
 
@@ -703,11 +682,10 @@ func (d *Driver) unclaimDiskResource(ctx context.Context, diskURI, ownerResource
 
 // DeleteVolume delete an azure disk
 func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runUseOperation(ctx, d, req, "DeleteVolume", d.deleteVolume)
+}
+
+func (d *Driver) deleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
@@ -786,11 +764,10 @@ func (d *Driver) ControllerGetVolume(context.Context, *csi.ControllerGetVolumeRe
 
 // ControllerModifyVolume modify volume
 func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runUseOperation(ctx, d, req, "ControllerModifyVolume", d.controllerModifyVolume)
+}
+
+func (d *Driver) controllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
@@ -894,7 +871,7 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 // ControllerPublishVolume attach an azure disk to a required node
 func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return runBlockSetup(ctx, d, req, req.GetNodeId(), true, d.controllerPublish)
+	return runUseOperation(ctx, d, req, "ControllerPublishVolume", d.controllerPublish)
 }
 
 func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
@@ -934,19 +911,6 @@ func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPubli
 		}
 	}
 
-	if d.publishedHold(ctx).Matches(diskURI) {
-		s := d.publishedHold(ctx).Selection()
-		if req.Readonly || disk == nil || disk.ID == nil || !strings.EqualFold(*disk.ID, s.ResourceID) || disk.Properties == nil ||
-			ptr.Deref(disk.Properties.UniqueID, "") != s.DiskUniqueID || ptr.Deref(disk.Properties.DiskSizeBytes, 0) != s.CapacityBytes ||
-			ptr.Deref(disk.Properties.MaxShares, 0) != 1 || len(disk.Properties.ShareInfo) != 0 || len(disk.ManagedByExtended) != 0 ||
-			!strings.EqualFold(ptr.Deref(disk.Properties.ProvisioningState, ""), "Succeeded") || disk.Properties.PropertyUpdatesInProgress != nil {
-			return nil, status.Error(codes.FailedPrecondition, "ordinary publication of enrolled disk incarnation unconfirmed")
-		}
-		vm, vmErr := (originAttachment{d}).Observe(ctx, s.NodeID)
-		if vmErr != nil || !strings.EqualFold(vm.ID, s.VMID) || vm.InstanceGUID != s.VMGUID || !strings.EqualFold(vm.ProvisioningState, "Succeeded") {
-			return nil, status.Error(codes.Unavailable, "enrolled target VM unavailable")
-		}
-	}
 	nodeID := req.GetNodeId()
 	if len(nodeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
@@ -1072,8 +1036,10 @@ func (d *Driver) controllerPublish(ctx context.Context, req *csi.ControllerPubli
 		lun, err = d.diskController.AttachDisk(ctx, diskName, diskURI, nodeName, cachingMode, disk, occupiedLuns)
 		if err != nil {
 			if derr, ok := err.(*volerr.DanglingAttachError); ok {
-				if d.publishedHold(ctx).Matches(diskURI) {
-					return nil, status.Error(codes.FailedPrecondition, "selected block disk has a dangling attachment")
+				if d.useDomain != nil {
+					if err := d.useDomain.CheckUnheld(ctx, diskURI, useDiskGroup(diskURI)); err != nil {
+						return nil, err
+					}
 				}
 				if strings.EqualFold(string(nodeName), string(derr.CurrentNode)) {
 					err := status.Errorf(codes.Internal, "volume %s is actually attached to current node %s, return error", diskURI, nodeName)
@@ -1172,11 +1138,10 @@ func ensureQADPVAnnotations(ctx context.Context, kubeClient clientset.Interface,
 
 // ControllerUnpublishVolume detach an azure disk from a required node
 func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runUseOperation(ctx, d, req, "ControllerUnpublishVolume", d.controllerUnpublishVolume)
+}
+
+func (d *Driver) controllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -1550,11 +1515,10 @@ func (d *Driver) listVolumesByResourceGroup(ctx context.Context, resourceGroup s
 
 // ControllerExpandVolume controller expand volume
 func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runUseOperation(ctx, d, req, "ControllerExpandVolume", d.controllerExpandVolume)
+}
+
+func (d *Driver) controllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
@@ -1639,11 +1603,10 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 
 // CreateSnapshot create a snapshot
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	end, guardErr := d.guardDisk(ctx, req, req.GetSourceVolumeId())
-	if guardErr != nil {
-		return nil, guardErr
-	}
-	defer end()
+	return runUseOperation(ctx, d, req, "CreateSnapshot", d.createSnapshot)
+}
+
+func (d *Driver) createSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	sourceVolumeID := req.GetSourceVolumeId()
 	if len(sourceVolumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")

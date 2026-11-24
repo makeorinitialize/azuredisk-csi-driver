@@ -24,17 +24,12 @@ import (
 	"k8s.io/component-base/featuregate"
 
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 )
 
 // DriverOptions defines driver parameters specified in driver deployment
 type DriverOptions struct {
-	// Origin is a programmatic opt-in only. No listener or production authority is installed.
-	Origin *devicelease.Origin
-	// PublishedBlock is a separate, one-use guard for an ordinary CSI block PV.
-	PublishedBlock *devicelease.BlockHold
-	// OnlineDomainConfig enables provider-journaled holds on external sources.
-	OnlineDomainConfig string
+	// DeviceUseConfig enables independently scoped durable source-use gates.
+	DeviceUseConfig string
 	// Common options
 	NodeID                     string
 	DriverName                 string
@@ -98,7 +93,7 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 		return nil
 	}
 	fs := flag.NewFlagSet("", flag.ExitOnError)
-	fs.StringVar(&o.OnlineDomainConfig, "online-block-domain-config", "", "protected JSON config for isolated external-source holds (off by default)")
+	fs.StringVar(&o.DeviceUseConfig, "device-use-config", "", "protected JSON config for authenticated durable source-use gates (off by default)")
 	if o.FeatureGates == nil {
 		o.FeatureGates = NewDriverFeatureGate()
 	}

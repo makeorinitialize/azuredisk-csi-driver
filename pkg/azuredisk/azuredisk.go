@@ -64,7 +64,7 @@ import (
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/deviceuse"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
@@ -107,11 +107,9 @@ type hostUtil interface {
 // Driver is the implementation of the Azure Disk CSI Driver.
 type Driver struct {
 	csicommon.CSIDriver
-	origin           *devicelease.Origin
-	publishedBlock   *devicelease.BlockHold
-	onlineDomain     *devicelease.OnlineDomain
-	onlineConfigPath string
-	onlineRESTConfig *rest.Config
+	useDomain     *deviceuse.Domain
+	useConfigPath string
+	useRESTConfig *rest.Config
 	// Embed UnimplementedXXXServer to ensure the driver returns Unimplemented for any
 	// new RPC methods that might be introduced in future versions of the spec.
 	csi.UnimplementedControllerServer
@@ -210,13 +208,13 @@ type Driver struct {
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
 func NewDriver(options *DriverOptions) *Driver {
-	driver := Driver{origin: options.Origin, publishedBlock: options.PublishedBlock, onlineConfigPath: options.OnlineDomainConfig}
+	driver := Driver{useConfigPath: options.DeviceUseConfig}
 	if options.FeatureGates == nil {
 		options.FeatureGates = NewDriverFeatureGate()
 	}
-	if options.OnlineDomainConfig != "" && (options.Origin != nil || options.PublishedBlock != nil ||
-		options.EnableMigrationMonitor || options.RemoveNotReadyTaint || options.FeatureGates.Enabled(NodeDrivenAttachDetach) || options.FeatureGates.Enabled(KataMount)) {
-		klog.Error("online block canary requires migration monitor, taint removal, QAD, Kata and other origin modes disabled")
+	if options.DeviceUseConfig != "" && (options.EnableMigrationMonitor || options.RemoveNotReadyTaint ||
+		options.FeatureGates.Enabled(NodeDrivenAttachDetach) || options.FeatureGates.Enabled(KataMount)) {
+		klog.Error("device-use admission requires migration monitor, taint removal, QAD and KataMount disabled")
 		return nil
 	}
 	driver.Name = options.DriverName
@@ -321,7 +319,7 @@ func NewDriver(options *DriverOptions) *Driver {
 		}
 	}
 	driver.kubeClient = kubeClient
-	driver.onlineRESTConfig = kubeConfig
+	driver.useRESTConfig = kubeConfig
 
 	if driver.NodeID != "" {
 		// Initialize HTTP client for wireserver calls (node component only)
@@ -384,9 +382,6 @@ func NewDriver(options *DriverOptions) *Driver {
 		driver.diskController = NewManagedDiskController(driver.cloud)
 		driver.diskController.AttachDetachInitialDelayInMs = int(driver.attachDetachInitialDelayInMs)
 		driver.diskController.ForceDetachBackoff = driver.forceDetachBackoff
-		if driver.publishedBlock != nil {
-			driver.diskController.noForceDiskID = driver.publishedBlock.Selection().ResourceID
-		}
 		driver.diskController.WaitForDetach = driver.waitForDetach
 		driver.diskController.WaitForDetachDiskComplete = driver.waitForDetachDiskComplete
 		driver.diskController.CheckDiskCountForBatching = driver.checkDiskCountForBatching
@@ -535,7 +530,7 @@ func (d *Driver) waitForPVInformerCacheSync(ctx context.Context, timeout time.Du
 
 // Run driver initialization
 func (d *Driver) Run(ctx context.Context) error {
-	onlineConfig, err := d.configureOnline(ctx)
+	useConfig, err := d.configureUse(ctx)
 	if err != nil {
 		return err
 	}
@@ -547,7 +542,6 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	opts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(
-			d.onlineNative,
 			grpcprom.NewServerMetrics().UnaryServerInterceptor(),
 			csicommon.LogGRPC,
 		),
@@ -570,11 +564,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	csi.RegisterIdentityServer(s, d)
 	csi.RegisterControllerServer(s, d)
 	csi.RegisterNodeServer(s, d)
-	stopOnline, err := d.startOnline(ctx, onlineConfig, s)
+	stopUse, err := d.startUse(ctx, useConfig, s)
 	if err != nil {
 		return err
 	}
-	defer stopOnline()
+	defer stopUse()
 
 	// Start the node informer if it was set up during driver initialization
 	if d.nodeInformerFactory != nil {

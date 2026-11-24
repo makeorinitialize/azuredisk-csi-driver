@@ -40,7 +40,7 @@ import (
 
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/deviceuse"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
@@ -110,8 +110,7 @@ type controllerCommon struct {
 	// This timeout should be lower than DetachOperationMinTimeoutInSeconds and cover most detach operations
 	VMSSDetachTimeoutInSeconds int
 	ForceDetachBackoff         bool
-	noForceDiskID              string
-	onlineDomain               *devicelease.OnlineDomain
+	useDomain                  *deviceuse.Domain
 	WaitForDetach              bool
 	CheckDiskCountForBatching  bool
 	// WaitForDetachDiskComplete controls whether detach waits until the disk is no longer managed by the detach target node:
@@ -518,32 +517,15 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
 		}
 
 		if err != nil && c.ForceDetachBackoff {
-			// Batches can be drained by a different caller. Never include a
-			// selected block PV in a force retry, regardless of who drains it.
-			retainCurrent := false
-			for id := range diskMap {
-				allowed := !strings.EqualFold(id, c.noForceDiskID)
-				if c.onlineDomain != nil {
-					var checkErr error
-					allowed, checkErr = c.onlineDomain.ForceRetryAllowed(ctx, id)
-					if checkErr != nil {
+			if c.useDomain != nil {
+				for id := range diskMap {
+					if checkErr := c.useDomain.CheckUnheld(ctx, id, useDiskGroup(id)); checkErr != nil {
 						return checkErr
 					}
 				}
-				if !allowed {
-					delete(diskMap, id)
-					retainCurrent = retainCurrent || id == formattedDiskURI
-				}
 			}
-			if len(diskMap) > 0 {
-				if otherErr := vmset.DetachDisk(ctx, nodeName, diskMap, true); otherErr != nil {
-					return otherErr
-				}
-			}
-			if retainCurrent {
-				return err
-			}
-			err = nil
+			klog.Errorf("azureDisk - DetachDisk(%s) from node %s failed with error: %v, retry with force detach", diskName, nodeName, err)
+			err = vmset.DetachDisk(ctx, nodeName, diskMap, true)
 		}
 	}
 

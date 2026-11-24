@@ -56,7 +56,6 @@ import (
 	"k8s.io/utils/ptr"
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/devicelease"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization/mockoptimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
@@ -1339,25 +1338,19 @@ func TestNodeUnstageVolumeQADDetachedResponses(t *testing.T) {
 		t.Skip("QAD is not supported on Windows")
 	}
 
+	const volumeID = "qad-volume"
 	tests := []struct {
 		name              string
 		postStatus        AttachmentStatus
 		getResponseStatus AttachmentStatus
 		emptyPostResponse bool
 		nullGetResponse   bool
-		guardOrdinary     bool
 		expectedRequests  []string
 		expectedCode      codes.Code
 	}{
 		{
 			name:             "immediate detached response",
 			postStatus:       AttachmentStatusDetached,
-			expectedRequests: []string{http.MethodPost},
-		},
-		{
-			name:             "ordinary QAD detach under origin admission",
-			postStatus:       AttachmentStatusDetached,
-			guardOrdinary:    true,
 			expectedRequests: []string{http.MethodPost},
 		},
 		{
@@ -1394,12 +1387,6 @@ func TestNodeUnstageVolumeQADDetachedResponses(t *testing.T) {
 			driver := d.(*fakeDriver)
 			driver.nodeDrivenAttachDetachEnabled = true
 
-			volumeID := "qad-volume"
-			authority := &csiAuthority{t: t}
-			if test.guardOrdinary {
-				volumeID = testVolumeID
-				driver.origin = devicelease.NewOrigin(authority)
-			}
 			pv := newTestPV(volumeID)
 			pv.Annotations = map[string]string{
 				consts.AttachSequenceAnnotation:  "0",
@@ -1420,9 +1407,6 @@ func TestNodeUnstageVolumeQADDetachedResponses(t *testing.T) {
 
 			requestCount := 0
 			driver.httpClient = &http.Client{Transport: testRoundTripper(func(request *http.Request) (*http.Response, error) {
-				if test.guardOrdinary {
-					require.True(t, authority.busy, "check-then-QAD-detach window")
-				}
 				require.Less(t, requestCount, len(test.expectedRequests))
 				assert.Equal(t, test.expectedRequests[requestCount], request.Method)
 				if request.Method == http.MethodPost {
