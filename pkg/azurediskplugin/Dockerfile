@@ -23,5 +23,6 @@ ARG ARCH=amd64
 ARG PLUGIN_NAME=azurediskplugin
 ARG binary=./_output/${ARCH}/${PLUGIN_NAME}
 COPY ${binary} /azurediskplugin
+RUN chmod 0755 /azurediskplugin
 
 ENTRYPOINT ["/azurediskplugin"]
